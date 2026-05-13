@@ -1,0 +1,14 @@
+[package]
+name = "cts6-emulator"
+version = "0.1.0"
+edition = "2021"
+description = "Stand-alone CTS6 swim-timer emulator for chronaris-mm. TCP-only, in-memory."
+publish = false
+
+[[bin]]
+name = "cts6-emulator"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30.0"
+chrono = "0.4"
