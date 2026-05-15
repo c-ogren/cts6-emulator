@@ -66,6 +66,25 @@ use ratatui::{
 /// pane each frame.
 static LOG_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 
+/// Channel into the dedicated audio thread. Each `()` sent on this
+/// channel triggers one playback of the embedded wall-touch beep.
+/// Initialized in `main()`; until then `play_beep()` is a no-op so
+/// early-startup code paths can call it safely.
+static AUDIO_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+/// Embedded WAV bytes for the wall-touch beep. Baked into the
+/// binary via `include_bytes!` so the emulator runs from any cwd
+/// without needing the source tree on disk.
+const BEEP_WAV: &[u8] = include_bytes!("cts-beep.wav");
+
+/// Fire the wall-touch beep once. Non-blocking: drops the request
+/// if the audio thread is missing or its queue is wedged.
+fn play_beep() {
+    if let Some(tx) = AUDIO_TX.get() {
+        let _ = tx.send(());
+    }
+}
+
 macro_rules! emu_log {
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
@@ -93,7 +112,15 @@ macro_rules! print {
 
 const FIRMWARE: &str = "1.232";
 const DEFAULT_ADDR: &str = "127.0.0.1:1337";
-const YEAR: u16 = 2026;
+
+/// Current calendar year (UTC), used to stamp the year field in the
+/// SSBIE event-result and meet-status frames. Read fresh on every
+/// call so a long-running emulator rolls over at midnight without
+/// needing a restart.
+fn current_year() -> u16 {
+    use chrono::Datelike;
+    chrono::Utc::now().year() as u16
+}
 
 /// Maximum lane capacity tracked internally. Real CTS6 timers come in
 /// 8- and 10-lane variants; we provision the larger one and let the
@@ -426,8 +453,9 @@ fn build_event_response(race: &Race) -> Vec<u8> {
         buf[16] = lane_count as u8;
     }
     // Year LE u16 at offsets 40-41.
-    buf[40] = (YEAR & 0xFF) as u8;
-    buf[41] = (YEAR >> 8) as u8;
+    let year = current_year();
+    buf[40] = (year & 0xFF) as u8;
+    buf[41] = (year >> 8) as u8;
     // Event LE u16 at 44-45 (mirror — wide-frame path uses this).
     buf[44] = (race.event & 0xFF) as u8;
     buf[45] = (race.event >> 8) as u8;
@@ -645,9 +673,10 @@ fn meet_status_reply() -> Vec<u8> {
     buf[11] = 7; // dow
     buf[12] = 5; // month
     buf[13] = 9; // day
-    buf[14] = (YEAR - 2000) as u8;
-    buf[40] = (YEAR & 0xFF) as u8;
-    buf[41] = (YEAR >> 8) as u8;
+    buf[14] = (current_year() - 2000) as u8;
+    let year = current_year();
+    buf[40] = (year & 0xFF) as u8;
+    buf[41] = (year >> 8) as u8;
     buf[50] = 0xFB; // trailer marker
     buf
 }
@@ -814,11 +843,18 @@ struct TuiApp {
     /// instead of dumping it into the log pane. Toggled by `/help`,
     /// `/?`, or F1; dismissed by Esc / Enter / `q` / `?`.
     show_help: bool,
+    /// Scroll offset (in lines) for the help popup. ↑/↓/PgUp/PgDn
+    /// adjust it; reset to 0 each time the popup opens.
+    help_scroll: u16,
     /// When `Some(race_no)`, draw a centered modal showing that
     /// race's per-lane results (place, finish time, every recorded
     /// split). Set by pressing Enter on a Race row in the stored
     /// events tree; cleared by Esc / Enter / `q`.
     show_results: Option<u16>,
+    /// When true, draw the configured event lineup as a centered
+    /// modal overlay instead of dumping it into the log pane.
+    /// Toggled by `/lineup show`; dismissed by any key.
+    show_lineup: bool,
     /// Which pane currently owns keyboard focus. Tab toggles between
     /// the command input (default) and the stored-events tree.
     focus: Focus,
@@ -920,10 +956,13 @@ fn draw(f: &mut Frame, app: &TuiApp) {
     draw_log(f, chunks[1], &app.log);
     draw_input(f, chunks[2], app);
     if app.show_help {
-        draw_help_popup(f, area);
+        draw_help_popup(f, area, app);
     }
     if let Some(race_no) = app.show_results {
         draw_results_popup(f, area, &app.state, race_no);
+    }
+    if app.show_lineup {
+        draw_lineup_popup(f, area, &app.state);
     }
 }
 
@@ -1371,16 +1410,22 @@ fn draw_input(f: &mut Frame, area: Rect, app: &TuiApp) {
     }
 }
 
-/// Centered modal that displays `HELP_TEXT` over the underlying TUI.
-/// Sized to the help content (with sensible caps), clamped to the
-/// terminal area, and `Clear`ed first so the scoreboard/log don't
-/// bleed through.
-fn draw_help_popup(f: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = HELP_TEXT.split('\n').map(Line::from).collect();
+/// Centered modal that displays the help text over the underlying
+/// TUI. Sized to the help content (with sensible caps), clamped to
+/// the terminal area, and `Clear`ed first so the scoreboard/log
+/// don't bleed through. Scrollable via ↑/↓/PgUp/PgDn when the
+/// content is taller than the popup.
+fn draw_help_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let lines = build_help_lines();
     let content_h = lines.len() as u16;
-    let content_w = HELP_TEXT
-        .split('\n')
-        .map(|l| l.chars().count() as u16)
+    let content_w = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>() as u16
+        })
         .max()
         .unwrap_or(0);
     // +2 for borders, +2 for a 1-col inner padding on each side.
@@ -1396,17 +1441,167 @@ fn draw_help_popup(f: &mut Frame, area: Rect) {
         width: w,
         height: h,
     };
+    // Inner viewport height (popup minus borders).
+    let view_h = h.saturating_sub(2);
+    let max_scroll = content_h.saturating_sub(view_h);
+    let scroll = app.help_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!(
+            " help [{}/{}]  ↑↓ PgUp/PgDn scroll  Esc to close ",
+            scroll + 1,
+            max_scroll + 1,
+        )
+    } else {
+        String::from(" help — Esc/Enter to close ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" help — Esc/Enter to close ")
+        .title(title)
         .style(Style::new().fg(Color::White).bg(Color::Black));
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         popup,
     );
+}
+
+/// Compute the maximum legal `help_scroll` for the current terminal
+/// size and help content. Mirrors the popup-sizing logic in
+/// [`draw_help_popup`] so the key handler and renderer agree on the
+/// bottom of the scrollable region.
+fn help_max_scroll() -> u16 {
+    let lines = build_help_lines();
+    let content_h = lines.len() as u16;
+    let (term_w, term_h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    let content_w = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>() as u16
+        })
+        .max()
+        .unwrap_or(0);
+    let want_w = content_w.saturating_add(4);
+    let want_h = content_h.saturating_add(2);
+    let w = want_w.min(term_w.saturating_sub(2)).max(20);
+    let h = want_h.min(term_h.saturating_sub(2)).max(5);
+    let _ = w;
+    let view_h = h.saturating_sub(2);
+    content_h.saturating_sub(view_h)
+}
+
+/// Build the help popup as styled `Line`s so commands and section
+/// headers stand out from their descriptions. The plain-text
+/// `HELP_TEXT` is still used by `print_help()` for the non-TUI
+/// fallback path.
+fn build_help_lines() -> Vec<Line<'static>> {
+    let header = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let cmd = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::Gray);
+
+    // (command, description). An empty command renders as a
+    // continuation line aligned under the description column.
+    let entry = |c: &'static str, d: &'static str| -> Line<'static> {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<22}", c), cmd),
+            Span::raw(" "),
+            Span::raw(d),
+        ])
+    };
+    let key_entry = |c: &'static str, d: &'static str| -> Line<'static> {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<22}", c), key),
+            Span::raw(" "),
+            Span::raw(d),
+        ])
+    };
+    let cont = |d: &'static str| -> Line<'static> {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::raw(" ".repeat(22)),
+            Span::raw(" "),
+            Span::styled(d, dim),
+        ])
+    };
+    let section = |t: &'static str| Line::from(Span::styled(t, header));
+    let blank = || Line::from("");
+
+    let mut v: Vec<Line<'static>> = Vec::new();
+    v.push(Line::from(Span::styled(
+        "cts6 emulator commands",
+        Style::new()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    v.push(blank());
+
+    v.push(section("meet setup:"));
+    v.push(entry("/event N", "set active event"));
+    v.push(entry("/heat N", "set active heat"));
+    v.push(entry("/race N", "set next race number (resume mid-meet)"));
+    v.push(entry("/lanes A..B", "set active lane spread (1..=10,"));
+    v.push(cont("e.g. /lanes 1..10, 2..8, 1..1)"));
+    v.push(entry("/lineup show", "list configured events"));
+    v.push(entry(
+        "/lineup preset hs",
+        "load NFHS high-school dual-meet lineup",
+    ));
+    v.push(entry(
+        "/lineup add D G S [Y]",
+        "add event (distance, M|F|X,",
+    ));
+    v.push(cont("stroke 1/FR 2/BK 3/BR 4/FL 5/IM"));
+    v.push(cont("6/MED-R 7/FR-R DV, optional split-yds)"));
+    v.push(entry("/lineup clear", "remove all events"));
+    v.push(blank());
+
+    v.push(section("running a race:"));
+    v.push(key_entry("<enter>", "start the race (timestamp 0.000)"));
+    v.push(key_entry("1..9", "touch lane 1..9 (single keypress —"));
+    v.push(cont("no Enter needed during a race)"));
+    v.push(key_entry("0", "touch lane 10"));
+    v.push(entry("/dq L", "mark lane L as DQ"));
+    v.push(entry(
+        "/  or  /print",
+        "finalize: last touch per lane = finish,",
+    ));
+    v.push(cont("earlier touches = cumulative splits;"));
+    v.push(cont("places assigned by ascending finish."));
+    v.push(cont("Heat auto-bumps by 1."));
+    v.push(blank());
+
+    v.push(section("inspection:"));
+    v.push(entry("/races", "list stored races"));
+    v.push(entry("/status", "show current state"));
+    v.push(entry("/help", "this popup (Esc/Enter to close)"));
+    v.push(entry("/quit", "exit"));
+    v.push(blank());
+
+    v.push(section("stored events tree (right pane):"));
+    v.push(key_entry(
+        "Tab",
+        "focus the tree (Tab/Esc returns to input)",
+    ));
+    v.push(key_entry("\u{2191} \u{2193} Home End", "navigate rows"));
+    v.push(key_entry(
+        "\u{2192} / Enter",
+        "expand event/heat (or open results",
+    ));
+    v.push(cont("popup on a Race row)"));
+    v.push(key_entry(
+        "\u{2190}",
+        "collapse (or jump to parent on a race)",
+    ));
+
+    v
 }
 
 /// Centered overlay showing per-lane results for a single finalized
@@ -1564,6 +1759,108 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
     );
 }
 
+/// Centered overlay showing the configured event lineup: event
+/// number, label, split distance, and expected touch count. The
+/// currently active event is highlighted with a marker. Triggered
+/// by `/lineup show`; dismissed by any key (Esc / Enter / q / etc.).
+fn draw_lineup_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
+    let s = state.lock().unwrap();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Event Lineup  ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "({} event{})",
+                s.lineup.len(),
+                if s.lineup.len() == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(Color::Gray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if s.lineup.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no lineup configured — try /lineup preset hs)",
+            Style::new().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  #     Event              Splits    Touches",
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  ──────────────────────────────────────────────────",
+            Style::new().fg(Color::DarkGray),
+        )));
+        for (i, e) in s.lineup.iter().enumerate() {
+            let event_no = (i + 1) as u16;
+            let is_current = event_no == s.current_event;
+            let segs = e.total_segments();
+            let marker = if is_current { "→" } else { " " };
+            let row_style = if is_current {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {marker} {:>3}  ", event_no),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{:<18} ", e.label()), row_style),
+                Span::styled(
+                    format!("{:>3}yd     ", e.split_yards),
+                    Style::new().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("{:>3} touch{}", segs, if segs == 1 { " " } else { "es" }),
+                    Style::new().fg(Color::Gray),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Esc/Enter to close",
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    // Size the popup to its longest visible line, then clamp to the
+    // available area. Account for borders + 1-col inner padding.
+    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let content_h = lines.len() as u16;
+    let want_w = content_w.saturating_add(4);
+    let want_h = content_h.saturating_add(2);
+    let w = want_w.min(area.width.saturating_sub(2)).max(30);
+    let h = want_h.min(area.height.saturating_sub(2)).max(7);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" event lineup — Esc/Enter to close ")
+        .style(Style::new().fg(Color::White).bg(Color::Black));
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 fn handle_event(app: &mut TuiApp, ev: Event) {
     let key = match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => k,
@@ -1576,7 +1873,27 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
-            _ => app.show_help = false,
+            // Scrolling — keep the popup open. Clamp to the
+            // current max scroll so we don't park past the bottom.
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                app.help_scroll = app.help_scroll.saturating_add(1).min(help_max_scroll());
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            }
+            (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+                app.help_scroll = app.help_scroll.saturating_add(8).min(help_max_scroll());
+            }
+            (KeyCode::PageUp, _) => {
+                app.help_scroll = app.help_scroll.saturating_sub(8);
+            }
+            (KeyCode::Home, _) => app.help_scroll = 0,
+            (KeyCode::End, _) => app.help_scroll = help_max_scroll(),
+            // Anything else dismisses.
+            _ => {
+                app.show_help = false;
+                app.help_scroll = 0;
+            }
         }
         return;
     }
@@ -1587,6 +1904,15 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
             _ => app.show_results = None,
+        }
+        return;
+    }
+    // Lineup popup: same dismiss-on-any-key UX as the results modal.
+    if app.show_lineup {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+            _ => app.show_lineup = false,
         }
         return;
     }
@@ -1683,6 +2009,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
         }
         (KeyCode::F(1), _) => {
             app.show_help = true;
+            app.help_scroll = 0;
         }
         (KeyCode::Tab, _) => {
             app.focus = Focus::Tree;
@@ -1714,6 +2041,13 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             let trimmed = line.trim();
             if trimmed == "/help" || trimmed == "/?" {
                 app.show_help = true;
+                app.help_scroll = 0;
+                return;
+            }
+            // Intercept `/lineup show` so it pops the modal overlay
+            // instead of dumping the lineup into the log pane.
+            if trimmed == "/lineup show" || trimmed == "/lineup" {
+                app.show_lineup = true;
                 return;
             }
             let keep = {
@@ -1785,6 +2119,25 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             if m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
                 return;
             }
+
+            // Auto-touch: while a race is in progress and the input
+            // buffer is empty, a single digit fires a lane touch
+            // instantly — no Enter required. `1`..`9` map to lanes
+            // 1..9; `0` maps to lane 10. Touches outside the active
+            // lane spread are ignored by `touch_lane` itself.
+            if app.input.is_empty() && c.is_ascii_digit() {
+                let mut s = app.state.lock().unwrap();
+                if s.in_progress.is_some() {
+                    let lane = if c == '0' {
+                        10
+                    } else {
+                        c.to_digit(10).unwrap() as u8
+                    };
+                    touch_lane(&mut s, lane);
+                    return;
+                }
+            }
+
             app.input.insert(app.cursor, c);
             app.cursor += 1;
         }
@@ -1919,6 +2272,7 @@ fn touch_lane(state: &mut State, lane: u8) {
         _ => cum,
     };
     entry.touches_ms.push(cum);
+    play_beep();
     let n = entry.touches_ms.len() as u16;
     if total_segments > 0 && n >= total_segments {
         entry.finished_at = Some(cum);
@@ -2336,6 +2690,37 @@ fn main() {
     let (log_tx, log_rx) = mpsc::channel::<String>();
     let _ = LOG_TX.set(log_tx);
 
+    // Audio thread owns the rodio output stream (which is !Send) for
+    // the lifetime of the process. Each `()` on the channel plays the
+    // beep once and detaches; missing audio devices (CI, headless)
+    // log a warning and leave `AUDIO_TX` unset so `play_beep()` is a
+    // silent no-op.
+    let (audio_tx, audio_rx) = mpsc::channel::<()>();
+    let _ = AUDIO_TX.set(audio_tx);
+    thread::spawn(move || match rodio::OutputStream::try_default() {
+        Ok((_stream, handle)) => {
+            // _stream must stay alive for playback to work; bind it
+            // for the entire thread.
+            while audio_rx.recv().is_ok() {
+                let cursor = std::io::Cursor::new(BEEP_WAV);
+                match rodio::Decoder::new(cursor) {
+                    Ok(source) => {
+                        if let Ok(sink) = rodio::Sink::try_new(&handle) {
+                            sink.append(source);
+                            sink.detach();
+                        }
+                    }
+                    Err(e) => emu_log!("[audio] decode failed: {e}"),
+                }
+            }
+        }
+        Err(e) => {
+            emu_log!("[audio] no output device ({e}) — beeps disabled");
+            // Drain forever so senders don't pile up unbounded.
+            while audio_rx.recv().is_ok() {}
+        }
+    });
+
     {
         let s = Arc::clone(&state);
         let a = addr.clone();
@@ -2359,7 +2744,9 @@ fn main() {
         scratch: String::new(),
         quit: false,
         show_help: false,
+        help_scroll: 0,
         show_results: None,
+        show_lineup: false,
         focus: Focus::Input,
         tree_expanded_events: HashSet::new(),
         tree_expanded_heats: HashSet::new(),

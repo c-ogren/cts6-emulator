@@ -12,3 +12,7 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.30.0"
 chrono = "0.4"
+# Audio playback for the wall-touch beep. `wav` is the only decoder
+# we need; disabling defaults skips mp3/symphonia and their heavy
+# transitive deps.
+rodio = { version = "0.17", default-features = false, features = ["wav"] }
