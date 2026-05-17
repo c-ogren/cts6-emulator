@@ -45,6 +45,8 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod lineups;
+
 use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
@@ -136,14 +138,14 @@ const WIRE_LANES: usize = 8;
 // ─── Domain ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gender {
+pub(crate) enum Gender {
     Male,
     Female,
     Mixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stroke {
+pub(crate) enum Stroke {
     Free,
     Back,
     Breast,
@@ -189,15 +191,15 @@ impl Stroke {
 }
 
 #[derive(Debug, Clone)]
-struct EventDef {
-    distance: u16,
-    gender: Gender,
-    stroke: Stroke,
+pub(crate) struct EventDef {
+    pub(crate) distance: u16,
+    pub(crate) gender: Gender,
+    pub(crate) stroke: Stroke,
     /// Yards per split segment (typically 50; some meets use 25 for
     /// short-course / age-group races). Used purely to compute the
     /// total expected touch count per lane and to drive the scoreboard
     /// SPLIT/FINISH ARMED indicator. Ignored for diving.
-    split_yards: u16,
+    pub(crate) split_yards: u16,
 }
 
 impl EventDef {
@@ -853,8 +855,12 @@ struct TuiApp {
     show_results: Option<u16>,
     /// When true, draw the configured event lineup as a centered
     /// modal overlay instead of dumping it into the log pane.
-    /// Toggled by `/lineup show`; dismissed by any key.
+    /// Toggled by `/lineup show`; dismissed by any key other than
+    /// the scroll keys.
     show_lineup: bool,
+    /// Scroll offset (in lines) for the lineup popup. ↑/↓/PgUp/PgDn
+    /// adjust it; reset to 0 each time the popup opens.
+    lineup_scroll: u16,
     /// Which pane currently owns keyboard focus. Tab toggles between
     /// the command input (default) and the stored-events tree.
     focus: Focus,
@@ -962,7 +968,7 @@ fn draw(f: &mut Frame, app: &TuiApp) {
         draw_results_popup(f, area, &app.state, race_no);
     }
     if app.show_lineup {
-        draw_lineup_popup(f, area, &app.state);
+        draw_lineup_popup(f, area, app);
     }
 }
 
@@ -1554,9 +1560,11 @@ fn build_help_lines() -> Vec<Line<'static>> {
     v.push(cont("e.g. /lanes 1..10, 2..8, 1..1)"));
     v.push(entry("/lineup show", "list configured events"));
     v.push(entry(
-        "/lineup preset hs",
-        "load NFHS high-school dual-meet lineup",
+        "/lineup preset P [G]",
+        "load preset lineup; gender defaults to Mixed:",
     ));
+    v.push(cont("P = hs | ncaa13 | ncaa15 | ncaa16"));
+    v.push(cont("G = M | F | X"));
     v.push(entry(
         "/lineup add D G S [Y]",
         "add event (distance, M|F|X,",
@@ -1762,13 +1770,10 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
     );
 }
 
-/// Centered overlay showing the configured event lineup: event
-/// number, label, split distance, and expected touch count. The
-/// currently active event is highlighted with a marker. Triggered
-/// by `/lineup show`; dismissed by any key (Esc / Enter / q / etc.).
-fn draw_lineup_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
-    let s = state.lock().unwrap();
-
+/// Build the styled lines that fill the lineup popup. Split out
+/// from [`draw_lineup_popup`] so [`lineup_max_scroll`] can size the
+/// scrollable region using identical content.
+fn build_lineup_lines(s: &State) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
@@ -1831,9 +1836,22 @@ fn draw_lineup_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  Esc/Enter to close",
+        "  ↑↓ PgUp/PgDn scroll  Esc/Enter to close",
         Style::new().fg(Color::DarkGray),
     )));
+    lines
+}
+
+/// Centered overlay showing the configured event lineup: event
+/// number, label, split distance, and expected touch count. The
+/// currently active event is highlighted with a marker. Triggered
+/// by `/lineup show`; scrollable via ↑/↓/PgUp/PgDn when the content
+/// is taller than the popup; dismissed by any other key.
+fn draw_lineup_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let lines = {
+        let s = app.state.lock().unwrap();
+        build_lineup_lines(&s)
+    };
 
     // Size the popup to its longest visible line, then clamp to the
     // available area. Account for borders + 1-col inner padding.
@@ -1851,17 +1869,50 @@ fn draw_lineup_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
         width: w,
         height: h,
     };
+    let view_h = h.saturating_sub(2);
+    let max_scroll = content_h.saturating_sub(view_h);
+    let scroll = app.lineup_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!(
+            " event lineup [{}/{}]  ↑↓ PgUp/PgDn scroll  Esc to close ",
+            scroll + 1,
+            max_scroll + 1,
+        )
+    } else {
+        String::from(" event lineup — Esc/Enter to close ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" event lineup — Esc/Enter to close ")
+        .title(title)
         .style(Style::new().fg(Color::White).bg(Color::Black));
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         popup,
     );
+}
+
+/// Compute the maximum legal `lineup_scroll` for the current
+/// terminal size and lineup content. Mirrors the popup-sizing logic
+/// in [`draw_lineup_popup`] so the key handler and renderer agree
+/// on the bottom of the scrollable region.
+fn lineup_max_scroll(state: &Arc<Mutex<State>>) -> u16 {
+    let lines = {
+        let s = state.lock().unwrap();
+        build_lineup_lines(&s)
+    };
+    let content_h = lines.len() as u16;
+    let (_term_w, term_h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let want_w = content_w.saturating_add(4);
+    let want_h = content_h.saturating_add(2);
+    let _ = want_w;
+    let h = want_h.min(term_h.saturating_sub(2)).max(7);
+    let view_h = h.saturating_sub(2);
+    content_h.saturating_sub(view_h)
 }
 
 fn handle_event(app: &mut TuiApp, ev: Event) {
@@ -1910,12 +1961,35 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
         }
         return;
     }
-    // Lineup popup: same dismiss-on-any-key UX as the results modal.
+    // Lineup popup: scroll keys keep it open; anything else dismisses.
     if app.show_lineup {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
-            _ => app.show_lineup = false,
+            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                app.lineup_scroll = app
+                    .lineup_scroll
+                    .saturating_add(1)
+                    .min(lineup_max_scroll(&app.state));
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                app.lineup_scroll = app.lineup_scroll.saturating_sub(1);
+            }
+            (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+                app.lineup_scroll = app
+                    .lineup_scroll
+                    .saturating_add(8)
+                    .min(lineup_max_scroll(&app.state));
+            }
+            (KeyCode::PageUp, _) => {
+                app.lineup_scroll = app.lineup_scroll.saturating_sub(8);
+            }
+            (KeyCode::Home, _) => app.lineup_scroll = 0,
+            (KeyCode::End, _) => app.lineup_scroll = lineup_max_scroll(&app.state),
+            _ => {
+                app.show_lineup = false;
+                app.lineup_scroll = 0;
+            }
         }
         return;
     }
@@ -2051,6 +2125,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             // instead of dumping the lineup into the log pane.
             if trimmed == "/lineup show" || trimmed == "/lineup" {
                 app.show_lineup = true;
+                app.lineup_scroll = 0;
                 return;
             }
             let keep = {
@@ -2431,41 +2506,6 @@ fn print_lineup(state: &State) {
     }
 }
 
-/// Standard NFHS high-school dual-meet event order (12 events).
-/// All gendered as Mixed for emulator simplicity \u2014 in a real coed
-/// dual the same 12 are run twice (girls then boys). Splits default
-/// to 50 yd, which matches CTS6 split-arm behaviour for these races.
-fn high_school_lineup(gender: Gender) -> Vec<EventDef> {
-    use Gender::Mixed;
-    use Stroke::*;
-    let mk = |distance: u16, stroke: Stroke| EventDef {
-        distance,
-        gender,
-        stroke,
-        split_yards: 50,
-    };
-    vec![
-        mk(200, MedleyRelay), //  1. 200 medley relay   (BK/BR/FL/FR, 50 each)
-        mk(200, Free),        //  2. 200 free
-        mk(200, Im),          //  3. 200 IM             (FL/BK/BR/FR, 50 each)
-        mk(50, Free),         //  4. 50 free
-        EventDef {
-            //  5. diving
-            distance: 0,
-            gender: Mixed,
-            stroke: Diving,
-            split_yards: 0,
-        },
-        mk(100, Fly),            //  6. 100 fly
-        mk(100, Free),           //  7. 100 free
-        mk(500, Free),           //  8. 500 free
-        mk(200, FreestyleRelay), //  9. 200 free relay     (4\u00d750 free)
-        mk(100, Back),           // 10. 100 back
-        mk(100, Breast),         // 11. 100 breast
-        mk(400, FreestyleRelay), // 12. 400 free relay     (4\u00d7100 free, splits every 50)
-    ]
-}
-
 fn print_races(state: &State) {
     if state.races.is_empty() {
         println!("(no races stored)");
@@ -2570,19 +2610,43 @@ fn handle_command(state: &mut State, line: &str) -> bool {
                         ),
                     }
                 }
-                "preset" => match parts.next().unwrap_or("") {
-                    "hs" | "highschool" | "high-school" => {
-                        let gender = parts.next().and_then(parse_gender).unwrap_or(Gender::Mixed);
-                        state.lineup = high_school_lineup(gender);
-                        println!(
-                            "loaded high-school dual-meet lineup ({} events)",
-                            state.lineup.len()
-                        );
+                "preset" => {
+                    let name = parts.next().unwrap_or("");
+                    let g = parts.next().and_then(parse_gender).unwrap_or(Gender::Mixed);
+                    match name {
+                        "hs" | "highschool" | "high-school" => {
+                            state.lineup = lineups::high_school_lineup_gender(g);
+                            println!(
+                                "loaded NFHS high-school dual-meet lineup ({} events)",
+                                state.lineup.len()
+                            );
+                        }
+                        "ncaa13" | "ncaa-13" => {
+                            state.lineup = lineups::ncaa_13_event(g);
+                            println!(
+                                "loaded NCAA 13-event program ({} events)",
+                                state.lineup.len()
+                            );
+                        }
+                        "ncaa15" | "ncaa-15" => {
+                            state.lineup = lineups::ncaa_15_event(g);
+                            println!(
+                                "loaded NCAA 15-event program ({} events)",
+                                state.lineup.len()
+                            );
+                        }
+                        "ncaa16" | "ncaa-16" => {
+                            state.lineup = lineups::ncaa_16_event(g);
+                            println!(
+                                "loaded NCAA 16-event program ({} events)",
+                                state.lineup.len()
+                            );
+                        }
+                        other => println!(
+                            "unknown preset: {other:?} (try /lineup preset hs|ncaa13|ncaa15|ncaa16 [M|F|X])"
+                        ),
                     }
-                    other => println!(
-                        "unknown preset: {other:?} (try /lineup preset hs)"
-                    ),
-                },
+                }
                 "clear" => {
                     state.lineup.clear();
                     println!("lineup cleared");
@@ -2657,7 +2721,9 @@ const HELP_TEXT: &str = "cts6 emulator commands:\n\
        /lanes A..B               set active lane spread (1..=10,\n\
                                    e.g. /lanes 1..10, 2..8, 1..1)\n\
        /lineup show              list configured events\n\
-       /lineup preset hs         load NFHS high-school dual-meet lineup\n\
+       /lineup preset P [G]      load preset lineup; gender defaults to Mixed:\n\
+                                   P = hs | ncaa13 | ncaa15 | ncaa16\n\
+                                   G = M | F | X\n\
        /lineup add D G S [Y]     add event (distance, M|F|X,\n\
                                    stroke 1/FR 2/BK 3/BR 4/FL 5/IM\n\
                                    6/MED-R 7/FR-R DV, optional split-yds)\n\
@@ -2776,6 +2842,7 @@ fn main() {
         help_scroll: 0,
         show_results: None,
         show_lineup: false,
+        lineup_scroll: 0,
         focus: Focus::Input,
         tree_expanded_events: HashSet::new(),
         tree_expanded_heats: HashSet::new(),
