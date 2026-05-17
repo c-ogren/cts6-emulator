@@ -998,7 +998,10 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
             )));
         }
         Some(ip) => {
-            let elapsed_ms = ip.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            let elapsed_ms = Instant::now()
+                .saturating_duration_since(ip.started_at)
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
             let event_def = s.lineup.get(ip.event as usize - 1);
             let label = event_def
                 .map(|e| e.label())
@@ -2196,6 +2199,26 @@ fn parse_lane_spread(s: &str) -> Option<(u8, u8)> {
     Some((lo, hi))
 }
 
+/// Spacing between the three start beeps. Purely cosmetic — the
+/// race clock starts on `<enter>`, not on the final beep.
+const STARTER_BEEP_GAP: Duration = Duration::from_millis(150);
+
+/// Fire the three-beep starting sequence on a background thread so
+/// the caller (which holds `State`'s mutex) returns immediately and
+/// the TUI / network threads stay responsive.
+fn starter_beeps() {
+    // Beep #1 fires inline so the operator hears the sequence start
+    // the moment the race begins; #2 and #3 are scheduled relative
+    // to now() and dispatched from a worker thread.
+    play_beep();
+    thread::spawn(move || {
+        thread::sleep(STARTER_BEEP_GAP);
+        play_beep();
+        thread::sleep(STARTER_BEEP_GAP);
+        play_beep();
+    });
+}
+
 /// Start a new in-progress race for the current (event, heat).
 fn start_race(state: &mut State) {
     if state.in_progress.is_some() {
@@ -2220,6 +2243,8 @@ fn start_race(state: &mut State) {
         "race {race_no} started — {label} heat {heat} (touch lanes 1..8 — each touch is a split, / to finalize)",
         heat = state.current_heat,
     );
+    // Beeps run on a worker thread so they don't hold the State mutex.
+    starter_beeps();
 }
 
 /// Touch a lane during the in-progress race. Each call appends a
@@ -2257,7 +2282,10 @@ fn touch_lane(state: &mut State, lane: u8) {
             return;
         }
     };
-    let elapsed = ip.started_at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let elapsed = Instant::now()
+        .saturating_duration_since(ip.started_at)
+        .as_millis()
+        .min(u32::MAX as u128) as u32;
     let cum = elapsed.max(1);
     let entry = &mut ip.lanes[lane_idx];
     if entry.finished_at.is_some() {
@@ -2407,12 +2435,12 @@ fn print_lineup(state: &State) {
 /// All gendered as Mixed for emulator simplicity \u2014 in a real coed
 /// dual the same 12 are run twice (girls then boys). Splits default
 /// to 50 yd, which matches CTS6 split-arm behaviour for these races.
-fn high_school_lineup() -> Vec<EventDef> {
+fn high_school_lineup(gender: Gender) -> Vec<EventDef> {
     use Gender::Mixed;
     use Stroke::*;
     let mk = |distance: u16, stroke: Stroke| EventDef {
         distance,
-        gender: Mixed,
+        gender,
         stroke,
         split_yards: 50,
     };
@@ -2544,7 +2572,8 @@ fn handle_command(state: &mut State, line: &str) -> bool {
                 }
                 "preset" => match parts.next().unwrap_or("") {
                     "hs" | "highschool" | "high-school" => {
-                        state.lineup = high_school_lineup();
+                        let gender = parts.next().and_then(parse_gender).unwrap_or(Gender::Mixed);
+                        state.lineup = high_school_lineup(gender);
                         println!(
                             "loaded high-school dual-meet lineup ({} events)",
                             state.lineup.len()
