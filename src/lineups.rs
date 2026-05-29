@@ -26,7 +26,7 @@ pub(crate) fn high_school_lineup_gender(gender: Gender) -> Vec<EventDef> {
         EventDef {
             //  5. diving
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },
@@ -105,7 +105,7 @@ pub(crate) fn ncaa_13_event(gender: Gender) -> Vec<EventDef> {
         EventDef {
             //  6. diving
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },
@@ -116,7 +116,7 @@ pub(crate) fn ncaa_13_event(gender: Gender) -> Vec<EventDef> {
         EventDef {
             // 11. diving
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },
@@ -143,7 +143,7 @@ pub(crate) fn ncaa_15_event(gender: Gender) -> Vec<EventDef> {
         mk(200, MedleyRelay, gender),
         EventDef {
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },
@@ -153,7 +153,7 @@ pub(crate) fn ncaa_15_event(gender: Gender) -> Vec<EventDef> {
         mk(500, Free, gender),
         EventDef {
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },
@@ -180,7 +180,7 @@ pub(crate) fn ncaa_16_event(gender: Gender) -> Vec<EventDef> {
         mk(50, Free, gender),
         EventDef {
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },
@@ -191,7 +191,7 @@ pub(crate) fn ncaa_16_event(gender: Gender) -> Vec<EventDef> {
         mk(100, Fly, gender),
         EventDef {
             distance: 0,
-            gender: gender,
+            gender,
             stroke: Diving,
             split_yards: 0,
         },

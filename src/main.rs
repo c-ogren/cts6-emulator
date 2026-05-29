@@ -549,7 +549,7 @@ fn parse_request(buf: &[u8]) -> Request {
         return Request::MeetStatus;
     }
     // 7-byte slot query: 07 00 52 73 <slot> <chk> FF
-    if buf.len() == 7 && buf[0] == 0x07 && &buf[1..4] == [0x00, 0x52, 0x73] && buf[6] == 0xFF {
+    if buf.len() == 7 && buf[0] == 0x07 && buf[1..4] == [0x00, 0x52, 0x73] && buf[6] == 0xFF {
         return Request::Slot(buf[4]);
     }
     // SSBI{E,L,N,R} short: 11 bytes, ends 0xFE.
@@ -800,16 +800,22 @@ fn hex(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-fn fmt_time(ms: u32) -> String {
+fn fmt_time(ms: u32, buf: &mut [u8]) -> &str {
     let mins = ms / 60_000;
     let rem = ms % 60_000;
     let secs = rem / 1000;
     let millis = rem % 1000;
+
+    let mut cursor = std::io::Cursor::new(buf);
+
     if mins > 0 {
-        format!("{mins}:{secs:02}.{millis:03}")
+        let _ = write!(cursor, "{mins}:{secs:02}.{millis:03}");
     } else {
-        format!("{secs}.{millis:03}")
+        let _ = write!(cursor, "{secs}.{millis:03}");
     }
+
+    let len = cursor.position() as usize;
+    std::str::from_utf8(&cursor.into_inner()[..len]).unwrap()
 }
 
 /// Compact place label: "1st", "2nd", "3rd", "4th"\u2026 Up through 10
@@ -973,6 +979,8 @@ fn draw(f: &mut Frame, app: &TuiApp) {
 }
 
 fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
+    let mut time_buf1 = [0u8; 16];
+    let mut time_buf2 = [0u8; 16];
     let s = state.lock().unwrap();
     let (lo, hi) = s.lane_spread;
     let mut lines: Vec<Line> = Vec::with_capacity(12);
@@ -1024,7 +1032,7 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
                 ),
                 Span::raw("    running time  "),
                 Span::styled(
-                    fmt_time(elapsed_ms),
+                    fmt_time(elapsed_ms, &mut time_buf1),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("    {label}  heat {}", ip.heat)),
@@ -1108,7 +1116,10 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
                             "",
                         )
                     };
-                    spans.push(Span::styled(format!("{:>10}", fmt_time(t)), time_style));
+                    spans.push(Span::styled(
+                        format!("{:>10}", fmt_time(t, &mut time_buf2)),
+                        time_style,
+                    ));
                     if !tag.is_empty() {
                         spans.push(Span::styled(
                             tag.to_string(),
@@ -1144,7 +1155,7 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
                     if next_touch == total_segments {
                         // FINISH ARMED — 2Hz blink off race-elapsed
                         // ms (independent of redraw cadence).
-                        let on = (elapsed_ms / 500) % 2 == 0;
+                        let on = (elapsed_ms / 500).is_multiple_of(2);
                         let style = if on {
                             Style::new()
                                 .fg(Color::Black)
@@ -1233,6 +1244,7 @@ fn build_tree_rows(state: &State, app: &TuiApp) -> Vec<TreeRow> {
 }
 
 fn draw_stored_events(f: &mut Frame, area: Rect, app: &TuiApp) {
+    let mut time_buf = [0u8; 16];
     let s = app.state.lock().unwrap();
     let rows = build_tree_rows(&s, app);
     let focused = app.focus == Focus::Tree;
@@ -1317,7 +1329,7 @@ fn draw_stored_events(f: &mut Frame, area: Rect, app: &TuiApp) {
                             .map(|row| {
                                 let t = row.lane.finish_ms();
                                 if t > 0 {
-                                    fmt_time(t)
+                                    fmt_time(t, &mut time_buf).to_string()
                                 } else {
                                     "--".to_string()
                                 }
@@ -1685,6 +1697,8 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
         )));
     }
     for (i, row) in &rows {
+        let mut time_buf = [0u8; 16];
+        let mut time_buf2 = [0u8; 16];
         let lane_no = (*i as u8) + 1;
         let place_str = if row.place > 0 {
             place_label(row.place)
@@ -1713,7 +1727,7 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
             ));
         } else {
             spans.push(Span::styled(
-                format!("{:>10}  ", fmt_time(row.lane.finish_ms())),
+                format!("{:>10}  ", fmt_time(row.lane.finish_ms(), &mut time_buf2)),
                 Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
             ));
         }
@@ -1729,7 +1743,10 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
                 if j > 0 {
                     spans.push(Span::raw("  "));
                 }
-                spans.push(Span::styled(fmt_time(*ms), Style::new().fg(Color::Gray)));
+                spans.push(Span::styled(
+                    fmt_time(*ms, &mut time_buf).to_string(),
+                    Style::new().fg(Color::Gray),
+                ));
             }
         }
         lines.push(Line::from(spans));
@@ -2018,10 +2035,8 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             (KeyCode::Up, _) => {
                 app.tree_selected = app.tree_selected.saturating_sub(1);
             }
-            (KeyCode::Down, _) => {
-                if app.tree_selected < last {
-                    app.tree_selected += 1;
-                }
+            (KeyCode::Down, _) if app.tree_selected < last => {
+                app.tree_selected += 1;
             }
             (KeyCode::Home, _) => app.tree_selected = 0,
             (KeyCode::End, _) => app.tree_selected = last,
@@ -2136,26 +2151,18 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
                 app.quit = true;
             }
         }
-        (KeyCode::Backspace, _) => {
-            if app.cursor > 0 {
-                app.cursor -= 1;
-                app.input.remove(app.cursor);
-            }
+        (KeyCode::Backspace, _) if app.cursor > 0 => {
+            app.cursor -= 1;
+            app.input.remove(app.cursor);
         }
-        (KeyCode::Delete, _) => {
-            if app.cursor < app.input.len() {
-                app.input.remove(app.cursor);
-            }
+        (KeyCode::Delete, _) if app.cursor < app.input.len() => {
+            app.input.remove(app.cursor);
         }
-        (KeyCode::Left, _) => {
-            if app.cursor > 0 {
-                app.cursor -= 1;
-            }
+        (KeyCode::Left, _) if app.cursor > 0 => {
+            app.cursor -= 1;
         }
-        (KeyCode::Right, _) => {
-            if app.cursor < app.input.len() {
-                app.cursor += 1;
-            }
+        (KeyCode::Right, _) if app.cursor < app.input.len() => {
+            app.cursor += 1;
         }
         (KeyCode::Home, _) => app.cursor = 0,
         (KeyCode::End, _) => app.cursor = app.input.len(),
@@ -2332,6 +2339,7 @@ fn start_race(state: &mut State) {
 /// are ignored, matching CTS6 behaviour where a finished lane stops
 /// reading splits.
 fn touch_lane(state: &mut State, lane: u8) {
+    let mut time_buf = [0u8; 16];
     let (lo, hi) = state.lane_spread;
     if lane < lo || lane > hi {
         println!("(lane {lane} outside active spread {lo}..={hi})");
@@ -2381,12 +2389,16 @@ fn touch_lane(state: &mut State, lane: u8) {
         entry.finished_at = Some(cum);
         println!(
             "  lane {lane} → FINISH @ {} ({}/{} touches)",
-            fmt_time(cum),
+            fmt_time(cum, &mut time_buf),
             n,
             total_segments,
         );
     } else {
-        println!("  lane {lane} → split {} @ {}", n, fmt_time(cum),);
+        println!(
+            "  lane {lane} → split {} @ {}",
+            n,
+            fmt_time(cum, &mut time_buf),
+        );
     }
 }
 
@@ -2415,10 +2427,9 @@ fn dq_lane(state: &mut State, lane: u8) {
 /// Finalize the in-progress race (timer "store/print").
 ///
 /// Per-lane processing:
-///   * 0 touches & not DQ → empty lane (skipped in frame).
+///   * 0 touches & not DQ  → empty lane (skipped in frame).
 ///   * 0 touches & DQ      → lane row with place=0, dq=true.
-///   * ≥1 touches          → last touch = finish; earlier touches =
-///                            cumulative splits.
+///   * ≥1 touches          → last touch = finish; earlier touches = cumulative splits
 ///
 /// Place is assigned by sorting non-DQ lanes by finish time ascending.
 /// DQ lanes get place=0 (the parser surfaces them via the 0xFF
