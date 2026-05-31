@@ -37,7 +37,7 @@
 //!   SSBIE  short:  0B 00 53 53 42 49 45 <heat:u8> <event:u8> <chk> FE
 //!   SSBIE  long:   0D 00 53 53 42 49 45 <heat:le16> <event:le16> <chk> FD
 //!   event response: 0x05 short frame, 219 B (49 hdr + 8×21 lanes + 2 trailer).
-
+#![warn(clippy::pedantic)]
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -121,7 +121,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:1337";
 /// needing a restart.
 fn current_year() -> u16 {
     use chrono::Datelike;
-    chrono::Utc::now().year() as u16
+    u16::try_from(chrono::Utc::now().year()).unwrap_or(2000)
 }
 
 /// Maximum lane capacity tracked internally. Real CTS6 timers come in
@@ -271,7 +271,7 @@ struct Race {
     race_no: u16,
     lanes: [Option<LaneResultRow>; MAX_LANES],
     /// Number of cumulative split slots emitted in the on-wire frame.
-    /// Equals max(splits_per_lane) across all lanes — zero-padded for
+    /// Equals `max(splits_per_lane)` across all lanes — zero-padded for
     /// lanes that touched fewer times.
     splits_count: u8,
 }
@@ -284,7 +284,7 @@ struct InProgress {
     started_at: Instant,
     /// Per-lane touches in arrival order. Each push records the
     /// elapsed-since-start in ms. Final entry per lane becomes the
-    /// finish; earlier entries become interim splits. Indexed 0..MAX_LANES;
+    /// finish; earlier entries become interim splits. Indexed `0..MAX_LANES` but
     /// the active subset is constrained by `State::lane_spread`.
     lanes: [LaneTime; MAX_LANES],
 }
@@ -301,7 +301,7 @@ struct State {
     lineup: Vec<EventDef>,
     /// Currently-armed (mid-touch) race, if any.
     in_progress: Option<InProgress>,
-    /// All finalized races, keyed by race_no.
+    /// All finalized races, keyed by `race_no`.
     races: HashMap<u16, Race>,
     /// `(event, heat) -> race_no list` ordered oldest → newest.
     /// Used to seed SSBIE (latest) and walk SSBIL/SSBIN cursors.
@@ -377,9 +377,7 @@ impl State {
             Cursor::At(i) => (Cursor::At(i - 1), Some(i - 1)),
             // Coming back from the "off-the-end" sentinel returns to
             // the most recent race the user was just looking at.
-            Cursor::PastEnd => (Cursor::At(last_idx), Some(last_idx)),
-            // Wrap: prev-of-(off-the-start) loops to the newest race.
-            Cursor::PastStart => (Cursor::At(last_idx), Some(last_idx)),
+            Cursor::PastEnd | Cursor::PastStart => (Cursor::At(last_idx), Some(last_idx)),
         };
         self.cursor.insert((event, heat), next_cur);
         picked.and_then(|i| self.races.get(&races[i]))
@@ -396,10 +394,7 @@ impl State {
             Cursor::At(i) if i >= last_idx => (Cursor::PastEnd, None),
             Cursor::At(i) => (Cursor::At(i + 1), Some(i + 1)),
             // Wrap: next-of-(off-the-end) loops back to the oldest.
-            Cursor::PastEnd => (Cursor::At(0), Some(0)),
-            // Coming back from "off-the-start" returns to the oldest
-            // race (the boundary the user was just at).
-            Cursor::PastStart => (Cursor::At(0), Some(0)),
+            Cursor::PastEnd | Cursor::PastStart => (Cursor::At(0), Some(0)),
         };
         self.cursor.insert((event, heat), next_cur);
         picked.and_then(|i| self.races.get(&races[i]))
@@ -413,7 +408,7 @@ impl State {
 // ─── Frame helpers ─────────────────────────────────────────────────────
 
 fn cts6_chk(bytes: &[u8]) -> u8 {
-    let s: u32 = bytes.iter().map(|&b| b as u32).sum();
+    let s: u32 = bytes.iter().map(|&b| u32::from(b)).sum();
     (0xFFu32.wrapping_sub(s) & 0xFF) as u8
 }
 
@@ -427,15 +422,15 @@ fn cts6_chk(bytes: &[u8]) -> u8 {
 ///   dispatcher rejects it.
 /// * `splits_count >= 1` → long-with-splits frame (49 hdr + 8×stride
 ///   + 2 trailer where stride = 21 + splits*4). `buf[16]` is set to
-///   8 so the parser's `is_long_with_splits_frame` predicate accepts
-///   the layout. Per-lane block layout matches
-///   `parse_lane_table_long_with_splits`:
-///       0:                place (or 0xFF for DQ)
-///       1 .. 1+s*4:       splits[0..s] cumulative LE u32
-///       1+s*4..+4:        primary (final touch) LE u32
-///       +4..+4:           backup1 LE u32
-///       +8 zeroes:        pad
-///       +16..+4:          backup2 LE u32
+///     8 so the parser's `is_long_with_splits_frame` predicate accepts
+///     the layout. Per-lane block layout matches
+///     `parse_lane_table_long_with_splits`:
+///     0:                place (or 0xFF for DQ)
+///     1 .. 1+s*4:       splits[0..s] cumulative LE u32
+///     1+s*4..+4:        primary (final touch) LE u32
+///     +4..+4:           backup1 LE u32
+///     +8 zeroes:        pad
+///     +16..+4:          backup2 LE u32
 fn build_event_response(race: &Race) -> Vec<u8> {
     let splits = race.splits_count as usize;
     let stride = 21 + splits * 4;
@@ -452,7 +447,7 @@ fn build_event_response(race: &Race) -> Vec<u8> {
     // Lane-count slot at byte 16: required by long-with-splits
     // dispatcher; harmless for short frames (parser ignores it there).
     if splits > 0 {
-        buf[16] = lane_count as u8;
+        buf[16] = u8::try_from(lane_count).unwrap_or(0xFF);
     }
     // Year LE u16 at offsets 40-41.
     let year = current_year();
@@ -468,10 +463,7 @@ fn build_event_response(race: &Race) -> Vec<u8> {
 
     for i in 0..lane_count {
         let base = 49 + i * stride;
-        let row = match &race.lanes[i] {
-            Some(r) => r,
-            None => continue, // already zeroed
-        };
+        let Some(row) = &race.lanes[i] else { continue };
         let l = &row.lane;
         buf[base] = if l.dq { 0xFF } else { row.place };
         // Splits region: write up to `splits` cumulative values; zero
@@ -487,9 +479,7 @@ fn build_event_response(race: &Race) -> Vec<u8> {
         buf[primary_off..primary_off + 4].copy_from_slice(&primary.to_le_bytes());
         // Synthesise plausible backup buttons ± a few ms.
         let backup1 = primary.saturating_add(3);
-        let backup2 = primary
-            .saturating_sub(2)
-            .max(if primary > 0 { 1 } else { 0 });
+        let backup2 = primary.saturating_sub(2).max(u32::from(primary > 0));
         let b1_off = primary_off + 4;
         buf[b1_off..b1_off + 4].copy_from_slice(&backup1.to_le_bytes());
         // 8 pad bytes already zero.
@@ -572,13 +562,13 @@ fn parse_request(buf: &[u8]) -> Request {
             if matches!(v, Verb::ByRace) {
                 // SSBIR layout C: race in heat slot, event byte = 0.
                 return Request::FetchByRace {
-                    race: buf[7] as u16,
+                    race: u16::from(buf[7]),
                 };
             }
             return Request::Fetch {
                 verb: v,
                 heat: buf[7],
-                event: buf[8] as u16,
+                event: u16::from(buf[8]),
             };
         }
     }
@@ -628,7 +618,7 @@ fn identify_reply() -> Vec<u8> {
     // the first NUL after byte 2. The `0xFF` byte before `0xFE` is literal.
     let s = FIRMWARE.as_bytes();
     let mut buf = Vec::with_capacity(s.len() + 5);
-    let total = (s.len() + 5) as u8; // len + 00 + ascii + 00 + FF + FE
+    let total = u8::try_from(s.len() + 5).unwrap_or(0); // len + 00 + ascii + 00 + FF + FE
     buf.push(total);
     buf.push(0x00);
     buf.extend_from_slice(s);
@@ -675,7 +665,7 @@ fn meet_status_reply() -> Vec<u8> {
     buf[11] = 7; // dow
     buf[12] = 5; // month
     buf[13] = 9; // day
-    buf[14] = (current_year() - 2000) as u8;
+    buf[14] = (u8::try_from(current_year() - 2000)).unwrap_or(0); // year offset from 2000, clamped to fit in a byte
     let year = current_year();
     buf[40] = (year & 0xFF) as u8;
     buf[41] = (year >> 8) as u8;
@@ -707,15 +697,14 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-fn handle_client(mut stream: TcpStream, state: Arc<Mutex<State>>) {
+fn handle_client(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
     let peer = stream
         .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "?".into());
+        .map_or_else(|_| "?".into(), |a| a.to_string());
     emu_log!("[net] client connected: {peer}");
     // Match real-timer behaviour — short read timeout so a stuck reader
     // doesn't pin the only connection slot forever.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_read_timeout(Some(Duration::from_mins(1)));
 
     loop {
         let frame = match read_frame(&mut stream) {
@@ -775,14 +764,14 @@ fn handle_client(mut stream: TcpStream, state: Arc<Mutex<State>>) {
     emu_log!("[net] client disconnected: {peer}");
 }
 
-fn run_server(addr: &str, state: Arc<Mutex<State>>) -> io::Result<()> {
+fn run_server(addr: &str, state: &Arc<Mutex<State>>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     emu_log!("[net] listening on {addr}");
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                let s = Arc::clone(&state);
-                thread::spawn(move || handle_client(stream, s));
+                let s = Arc::clone(state);
+                thread::spawn(move || handle_client(stream, &s));
             }
             Err(e) => emu_log!("[net] accept error: {e}"),
         }
@@ -795,7 +784,7 @@ fn run_server(addr: &str, state: Arc<Mutex<State>>) -> io::Result<()> {
 fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
-        .map(|b| format!("{:02X}", b))
+        .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -814,7 +803,7 @@ fn fmt_time(ms: u32, buf: &mut [u8]) -> &str {
         let _ = write!(cursor, "{secs}.{millis:03}");
     }
 
-    let len = cursor.position() as usize;
+    let len = usize::try_from(cursor.position()).unwrap_or(0);
     std::str::from_utf8(&cursor.into_inner()[..len]).unwrap()
 }
 
@@ -931,7 +920,7 @@ fn run_tui(app: &mut TuiApp) -> io::Result<()> {
             // 100ms poll = 10 fps redraw cap, which is plenty for a
             // human-readable running clock and keeps CPU near zero.
             if event::poll(Duration::from_millis(100))? {
-                handle_event(app, event::read()?);
+                handle_event(app, &event::read()?);
             }
         }
         Ok(())
@@ -950,7 +939,7 @@ fn draw(f: &mut Frame, app: &TuiApp) {
     let lane_rows = {
         let s = app.state.lock().unwrap();
         let (lo, hi) = s.lane_spread;
-        hi.saturating_sub(lo).saturating_add(1) as u16
+        u16::from(hi.saturating_sub(lo).saturating_add(1))
     };
     let scoreboard_h = (lane_rows + 5).max(7);
     let chunks = Layout::vertical([
@@ -1012,18 +1001,19 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
             )));
         }
         Some(ip) => {
-            let elapsed_ms = Instant::now()
-                .saturating_duration_since(ip.started_at)
-                .as_millis()
-                .min(u32::MAX as u128) as u32;
+            let elapsed_ms = u32::try_from(
+                Instant::now()
+                    .saturating_duration_since(ip.started_at)
+                    .as_millis()
+                    .min(u128::from(u32::MAX)),
+            )
+            .unwrap_or(0);
             let event_def = s.lineup.get(ip.event as usize - 1);
-            let label = event_def
-                .map(|e| e.label())
-                .unwrap_or_else(|| format!("event {}", ip.event));
+            let label = event_def.map_or_else(|| format!("event {}", ip.event), EventDef::label);
             // Total expected touches per lane (final = finish, earlier
             // = splits). Default to 1 if no matching EventDef \u2014 a free
             // race with no lineup acts like a single-segment sprint.
-            let total_segments = event_def.map(|e| e.total_segments()).unwrap_or(1);
+            let total_segments = event_def.map_or(1, EventDef::total_segments);
             lines.push(Line::from(vec![
                 Span::raw("  race "),
                 Span::styled(
@@ -1052,7 +1042,7 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
                     .iter()
                     .enumerate()
                     .filter(|(i, lt)| {
-                        let ln = (*i as u8) + 1;
+                        let ln = (u8::try_from(*i).unwrap_or(0)) + 1;
                         ln >= lo && ln <= hi && !lt.dq && lt.finished_at.is_some()
                     })
                     .map(|(i, lt)| (i, lt.finished_at.unwrap()))
@@ -1061,11 +1051,11 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
                 ranked
                     .into_iter()
                     .enumerate()
-                    .map(|(rank, (idx, _))| (idx, (rank + 1) as u8))
+                    .map(|(rank, (idx, _))| (idx, u8::try_from(rank + 1).unwrap_or(0)))
                     .collect()
             };
             for (i, lt) in ip.lanes.iter().enumerate() {
-                let lane_no = (i + 1) as u8;
+                let lane_no = u8::try_from(i + 1).unwrap_or(0);
                 if lane_no < lo || lane_no > hi {
                     continue;
                 }
@@ -1151,7 +1141,9 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
                 // arm tag. With no lineup entry (total_segments==0)
                 // we can't infer arm state, so suppress.
                 if !lt.dq && lt.finished_at.is_none() && total_segments > 0 {
-                    let next_touch = (lt.touches_ms.len() as u16).saturating_add(1);
+                    let next_touch = u16::try_from(lt.touches_ms.len())
+                        .unwrap_or(0)
+                        .saturating_add(1);
                     if next_touch == total_segments {
                         // FINISH ARMED — 2Hz blink off race-elapsed
                         // ms (independent of redraw cadence).
@@ -1199,7 +1191,7 @@ fn draw_scoreboard(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>) {
 fn build_tree_rows(state: &State, app: &TuiApp) -> Vec<TreeRow> {
     // Group history by event for the top-level rows.
     let mut by_event: HashMap<u16, Vec<(u8, &Vec<u16>)>> = HashMap::new();
-    for ((event_no, heat), races) in state.history.iter() {
+    for ((event_no, heat), races) in &state.history {
         by_event.entry(*event_no).or_default().push((*heat, races));
     }
     let mut events: Vec<u16> = by_event.keys().copied().collect();
@@ -1291,8 +1283,7 @@ fn draw_stored_events(f: &mut Frame, area: Rect, app: &TuiApp) {
                     let label = s
                         .lineup
                         .get(*event_no as usize - 1)
-                        .map(|e| e.label())
-                        .unwrap_or_else(|| format!("event {event_no}"));
+                        .map_or_else(|| format!("event {event_no}"), EventDef::label);
                     let txt = format!(
                         " {cursor} {arrow} Event {event_no:>2}  {label}  ({heat_count}h/{race_count}r)"
                     );
@@ -1424,7 +1415,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &TuiApp) {
     // owns the keyboard — otherwise it looks like keystrokes will
     // land here when they're really going to the tree.
     if focused {
-        let cx = area.x + 1 + PROMPT.len() as u16 + app.cursor as u16;
+        let cx = area.x
+            + 1
+            + u16::try_from(PROMPT.len()).unwrap_or(0)
+            + u16::try_from(app.cursor).unwrap_or(0);
         let cy = area.y + 1;
         let max_x = area.x + area.width.saturating_sub(2);
         f.set_cursor_position((cx.min(max_x), cy));
@@ -1436,16 +1430,19 @@ fn draw_input(f: &mut Frame, area: Rect, app: &TuiApp) {
 /// the terminal area, and `Clear`ed first so the scoreboard/log
 /// don't bleed through. Scrollable via ↑/↓/PgUp/PgDn when the
 /// content is taller than the popup.
-fn draw_help_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
+fn draw_help_popup(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let lines = build_help_lines();
-    let content_h = lines.len() as u16;
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
     let content_w = lines
         .iter()
         .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>() as u16
+            u16::try_from(
+                l.spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>(),
+            )
+            .unwrap_or(0)
         })
         .max()
         .unwrap_or(0);
@@ -1479,8 +1476,8 @@ fn draw_help_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
         .borders(Borders::ALL)
         .title(title)
         .style(Style::new().fg(Color::White).bg(Color::Black));
-    f.render_widget(Clear, popup);
-    f.render_widget(
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
         Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false })
@@ -1495,15 +1492,18 @@ fn draw_help_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
 /// bottom of the scrollable region.
 fn help_max_scroll() -> u16 {
     let lines = build_help_lines();
-    let content_h = lines.len() as u16;
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
     let (term_w, term_h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
     let content_w = lines
         .iter()
         .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>() as u16
+            u16::try_from(
+                l.spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>(),
+            )
+            .unwrap_or(0)
         })
         .max()
         .unwrap_or(0);
@@ -1531,7 +1531,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     let entry = |c: &'static str, d: &'static str| -> Line<'static> {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{:<22}", c), cmd),
+            Span::styled(format!("{c:<22}"), cmd),
             Span::raw(" "),
             Span::raw(d),
         ])
@@ -1539,7 +1539,7 @@ fn build_help_lines() -> Vec<Line<'static>> {
     let key_entry = |c: &'static str, d: &'static str| -> Line<'static> {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{:<22}", c), key),
+            Span::styled(format!("{c:<22}"), key),
             Span::raw(" "),
             Span::raw(d),
         ])
@@ -1555,74 +1555,56 @@ fn build_help_lines() -> Vec<Line<'static>> {
     let section = |t: &'static str| Line::from(Span::styled(t, header));
     let blank = || Line::from("");
 
-    let mut v: Vec<Line<'static>> = Vec::new();
-    v.push(Line::from(Span::styled(
-        "cts6 emulator commands",
-        Style::new()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    )));
-    v.push(blank());
-
-    v.push(section("meet setup:"));
-    v.push(entry("/event N", "set active event"));
-    v.push(entry("/heat N", "set active heat"));
-    v.push(entry("/race N", "set next race number (resume mid-meet)"));
-    v.push(entry("/lanes A..B", "set active lane spread (1..=10,"));
-    v.push(cont("e.g. /lanes 1..10, 2..8, 1..1)"));
-    v.push(entry("/lineup show", "list configured events"));
-    v.push(entry(
-        "/lineup preset P [G]",
-        "load preset lineup; gender defaults to Mixed:",
-    ));
-    v.push(cont("P = hs | ncaa13 | ncaa15 | ncaa16"));
-    v.push(cont("G = M | F | X"));
-    v.push(entry(
-        "/lineup add D G S [Y]",
-        "add event (distance, M|F|X,",
-    ));
-    v.push(cont("stroke 1/FR 2/BK 3/BR 4/FL 5/IM"));
-    v.push(cont("6/MED-R 7/FR-R DV, optional split-yds)"));
-    v.push(entry("/lineup clear", "remove all events"));
-    v.push(blank());
-
-    v.push(section("running a race:"));
-    v.push(key_entry("<enter>", "start the race (timestamp 0.000)"));
-    v.push(key_entry("1..9", "touch lane 1..9 (single keypress —"));
-    v.push(cont("no Enter needed during a race)"));
-    v.push(key_entry("0", "touch lane 10"));
-    v.push(entry("/dq L", "mark lane L as DQ"));
-    v.push(entry(
-        "/  or  /print",
-        "finalize: last touch per lane = finish,",
-    ));
-    v.push(cont("earlier touches = cumulative splits;"));
-    v.push(cont("places assigned by ascending finish."));
-    v.push(cont("Heat auto-bumps by 1."));
-    v.push(blank());
-
-    v.push(section("inspection:"));
-    v.push(entry("/races", "list stored races"));
-    v.push(entry("/status", "show current state"));
-    v.push(entry("/help", "this popup (Esc/Enter to close)"));
-    v.push(entry("/quit", "exit"));
-    v.push(blank());
-
-    v.push(section("stored events tree (right pane):"));
-    v.push(key_entry(
-        "Tab",
-        "focus the tree (Tab/Esc returns to input)",
-    ));
-    v.push(key_entry("\u{2191} \u{2193} Home End", "navigate rows"));
-    v.push(key_entry(
-        "\u{2192} / Enter",
-        "expand event/heat (or open results",
-    ));
-    v.push(cont("popup on a Race row)"));
-    v.push(key_entry(
-        "\u{2190}",
-        "collapse (or jump to parent on a race)",
-    ));
+    let v: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            "cts6 emulator commands",
+            Style::new()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )),
+        blank(),
+        section("meet setup:"),
+        entry("/event N", "set active event"),
+        entry("/heat N", "set active heat"),
+        entry("/race N", "set next race number (resume mid-meet)"),
+        entry("/lanes A..B", "set active lane spread (1..=10,"),
+        cont("e.g. /lanes 1..10, 2..8, 1..1)"),
+        entry("/lineup show", "list configured events"),
+        entry(
+            "/lineup preset P [G]",
+            "load preset lineup; gender defaults to Mixed:",
+        ),
+        cont("P = hs | ncaa13 | ncaa15 | ncaa16"),
+        cont("G = M | F | X"),
+        entry("/lineup add D G S [Y]", "add event (distance, M|F|X,"),
+        cont("stroke 1/FR 2/BK 3/BR 4/FL 5/IM"),
+        cont("6/MED-R 7/FR-R DV, optional split-yds)"),
+        entry("/lineup clear", "remove all events"),
+        blank(),
+        section("running a race:"),
+        key_entry("<enter>", "start the race (timestamp 0.000)"),
+        key_entry("1..9", "touch lane 1..9 (single keypress —"),
+        cont("no Enter needed during a race)"),
+        key_entry("0", "touch lane 10"),
+        entry("/dq L", "mark lane L as DQ"),
+        entry("/  or  /print", "finalize: last touch per lane = finish,"),
+        cont("earlier touches = cumulative splits;"),
+        cont("places assigned by ascending finish."),
+        cont("Heat auto-bumps by 1."),
+        blank(),
+        section("inspection:"),
+        entry("/races", "list stored races"),
+        entry("/status", "show current state"),
+        entry("/help", "this popup (Esc/Enter to close)"),
+        entry("/quit", "exit"),
+        blank(),
+        section("stored events tree (right pane):"),
+        key_entry("Tab", "focus the tree (Tab/Esc returns to input)"),
+        key_entry("\u{2191} \u{2193} Home End", "navigate rows"),
+        key_entry("\u{2192} / Enter", "expand event/heat (or open results"),
+        cont("popup on a Race row)"),
+        key_entry("\u{2190}", "collapse (or jump to parent on a race)"),
+    ];
 
     v
 }
@@ -1631,17 +1613,16 @@ fn build_help_lines() -> Vec<Line<'static>> {
 /// race: place, finish time, and every cumulative split. Triggered
 /// by pressing Enter on a Race row in the stored-events tree;
 /// dismissed by any key (Esc / Enter / q / etc.).
-fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race_no: u16) {
+fn draw_results_popup(frame: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race_no: u16) {
     let s = state.lock().unwrap();
-    let race = match s.lookup_by_race(race_no) {
-        Some(r) => r,
-        None => return,
+    let Some(race) = s.lookup_by_race(race_no) else {
+        return;
     };
+
     let event_label = s
         .lineup
         .get((race.event as usize).saturating_sub(1))
-        .map(|e| e.label())
-        .unwrap_or_else(|| format!("event {}", race.event));
+        .map_or_else(|| format!("event {}", race.event), EventDef::label);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
@@ -1699,7 +1680,7 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
     for (i, row) in &rows {
         let mut time_buf = [0u8; 16];
         let mut time_buf2 = [0u8; 16];
-        let lane_no = (*i as u8) + 1;
+        let lane_no = (u8::try_from(*i).unwrap_or(0)) + 1;
         let place_str = if row.place > 0 {
             place_label(row.place)
         } else {
@@ -1707,7 +1688,7 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
         };
         let mut spans: Vec<Span> = vec![
             Span::styled(
-                format!("  {:>3}  ", place_str),
+                format!("  {place_str:>3}  "),
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1759,27 +1740,31 @@ fn draw_results_popup(f: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, race
 
     // Size the popup to its longest visible line, then clamp to the
     // available area. Account for borders + 1-col inner padding.
-    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
-    let content_h = lines.len() as u16;
+    let content_w = lines
+        .iter()
+        .map(|l| u16::try_from(l.width()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
     let want_w = content_w.saturating_add(4);
     let want_h = content_h.saturating_add(2);
-    let w = want_w.min(area.width.saturating_sub(2)).max(30);
-    let h = want_h.min(area.height.saturating_sub(2)).max(7);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let width = want_w.min(area.width.saturating_sub(2)).max(30);
+    let height = want_h.min(area.height.saturating_sub(2)).max(7);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect {
         x,
         y,
-        width: w,
-        height: h,
+        width,
+        height,
     };
     let title = format!(" race {} results — Esc/Enter to close ", race.race_no);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .style(Style::new().fg(Color::White).bg(Color::Black));
-    f.render_widget(Clear, popup);
-    f.render_widget(
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
         Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false }),
@@ -1825,7 +1810,7 @@ fn build_lineup_lines(s: &State) -> Vec<Line<'static>> {
             Style::new().fg(Color::DarkGray),
         )));
         for (i, e) in s.lineup.iter().enumerate() {
-            let event_no = (i + 1) as u16;
+            let event_no = u16::try_from(i + 1).unwrap_or(0);
             let is_current = event_no == s.current_event;
             let segs = e.total_segments();
             let marker = if is_current { "→" } else { " " };
@@ -1836,7 +1821,7 @@ fn build_lineup_lines(s: &State) -> Vec<Line<'static>> {
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {marker} {:>3}  ", event_no),
+                    format!("  {marker} {event_no:>3}  "),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("{:<18} ", e.label()), row_style),
@@ -1864,7 +1849,7 @@ fn build_lineup_lines(s: &State) -> Vec<Line<'static>> {
 /// currently active event is highlighted with a marker. Triggered
 /// by `/lineup show`; scrollable via ↑/↓/PgUp/PgDn when the content
 /// is taller than the popup; dismissed by any other key.
-fn draw_lineup_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
+fn draw_lineup_popup(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let lines = {
         let s = app.state.lock().unwrap();
         build_lineup_lines(&s)
@@ -1872,8 +1857,12 @@ fn draw_lineup_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
 
     // Size the popup to its longest visible line, then clamp to the
     // available area. Account for borders + 1-col inner padding.
-    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
-    let content_h = lines.len() as u16;
+    let content_w = lines
+        .iter()
+        .map(|l| u16::try_from(l.width()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
     let want_w = content_w.saturating_add(4);
     let want_h = content_h.saturating_add(2);
     let w = want_w.min(area.width.saturating_sub(2)).max(30);
@@ -1902,8 +1891,8 @@ fn draw_lineup_popup(f: &mut Frame, area: Rect, app: &TuiApp) {
         .borders(Borders::ALL)
         .title(title)
         .style(Style::new().fg(Color::White).bg(Color::Black));
-    f.render_widget(Clear, popup);
-    f.render_widget(
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
         Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false })
@@ -1921,9 +1910,13 @@ fn lineup_max_scroll(state: &Arc<Mutex<State>>) -> u16 {
         let s = state.lock().unwrap();
         build_lineup_lines(&s)
     };
-    let content_h = lines.len() as u16;
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
     let (_term_w, term_h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let content_w = lines
+        .iter()
+        .map(|l| u16::try_from(l.width()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
     let want_w = content_w.saturating_add(4);
     let want_h = content_h.saturating_add(2);
     let _ = want_w;
@@ -1932,7 +1925,7 @@ fn lineup_max_scroll(state: &Arc<Mutex<State>>) -> u16 {
     content_h.saturating_sub(view_h)
 }
 
-fn handle_event(app: &mut TuiApp, ev: Event) {
+fn handle_event(app: &mut TuiApp, ev: &Event) {
     let key = match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => k,
         _ => return,
@@ -1942,17 +1935,16 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
     // it can't accidentally edit the input buffer underneath.
     if app.show_help {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+            (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => app.quit = true,
             // Scrolling — keep the popup open. Clamp to the
             // current max scroll so we don't park past the bottom.
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            (KeyCode::Down | KeyCode::Char('j'), _) => {
                 app.help_scroll = app.help_scroll.saturating_add(1).min(help_max_scroll());
             }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            (KeyCode::Up | KeyCode::Char('k'), _) => {
                 app.help_scroll = app.help_scroll.saturating_sub(1);
             }
-            (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+            (KeyCode::PageDown | KeyCode::Char(' '), _) => {
                 app.help_scroll = app.help_scroll.saturating_add(8).min(help_max_scroll());
             }
             (KeyCode::PageUp, _) => {
@@ -1972,8 +1964,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
     // dismisses, Ctrl-C/D still quits the whole app.
     if app.show_results.is_some() {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
+            (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => app.quit = true,
             _ => app.show_results = None,
         }
         return;
@@ -1981,18 +1972,17 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
     // Lineup popup: scroll keys keep it open; anything else dismisses.
     if app.show_lineup {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-            | (KeyCode::Char('d'), KeyModifiers::CONTROL) => app.quit = true,
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => app.quit = true,
+            (KeyCode::Down | KeyCode::Char('j'), _) => {
                 app.lineup_scroll = app
                     .lineup_scroll
                     .saturating_add(1)
                     .min(lineup_max_scroll(&app.state));
             }
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            (KeyCode::Up | KeyCode::Char('k'), _) => {
                 app.lineup_scroll = app.lineup_scroll.saturating_sub(1);
             }
-            (KeyCode::PageDown, _) | (KeyCode::Char(' '), _) => {
+            (KeyCode::PageDown | KeyCode::Char(' '), _) => {
                 app.lineup_scroll = app
                     .lineup_scroll
                     .saturating_add(8)
@@ -2017,8 +2007,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
         // Quit shortcuts still work from any focus.
         if matches!(
             (key.code, key.modifiers),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                | (KeyCode::Char('d'), KeyModifiers::CONTROL)
+            (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL)
         ) {
             app.quit = true;
             return;
@@ -2031,7 +2020,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
         };
         let last = rows.len().saturating_sub(1);
         match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) | (KeyCode::Esc, _) => app.focus = Focus::Input,
+            (KeyCode::Tab | KeyCode::Esc, _) => app.focus = Focus::Input,
             (KeyCode::Up, _) => {
                 app.tree_selected = app.tree_selected.saturating_sub(1);
             }
@@ -2040,7 +2029,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             }
             (KeyCode::Home, _) => app.tree_selected = 0,
             (KeyCode::End, _) => app.tree_selected = last,
-            (KeyCode::Right, _) | (KeyCode::Enter, _) => {
+            (KeyCode::Right | KeyCode::Enter, _) => {
                 if let Some(row) = rows.get(app.tree_selected) {
                     match row {
                         TreeRow::Event { event_no, .. } => {
@@ -2094,9 +2083,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
         return;
     }
     match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL)
-        | (KeyCode::Char('d'), KeyModifiers::CONTROL)
-        | (KeyCode::Esc, _) => {
+        (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
             app.quit = true;
         }
         (KeyCode::F(1), _) => {
@@ -2121,7 +2108,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
             app.cursor = 0;
             if !line.trim().is_empty() {
                 // Avoid consecutive duplicates in history.
-                if app.history.last().map(|h| h.as_str()) != Some(line.as_str()) {
+                if app.history.last().map(std::string::String::as_str) != Some(line.as_str()) {
                     app.history.push(line.clone());
                 }
             }
@@ -2216,7 +2203,7 @@ fn handle_event(app: &mut TuiApp, ev: Event) {
                     let lane = if c == '0' {
                         10
                     } else {
-                        c.to_digit(10).unwrap() as u8
+                        u8::try_from(c.to_digit(10).unwrap()).unwrap_or(0)
                     };
                     touch_lane(&mut s, lane);
                     return;
@@ -2275,7 +2262,12 @@ fn parse_lane_spread(s: &str) -> Option<(u8, u8)> {
     let (a, b) = s.split_once("..")?;
     let lo: u8 = a.trim().parse().ok()?;
     let hi: u8 = b.trim().parse().ok()?;
-    if lo < 1 || hi < 1 || lo > MAX_LANES as u8 || hi > MAX_LANES as u8 || lo > hi {
+    if lo < 1
+        || hi < 1
+        || lo > u8::try_from(MAX_LANES).unwrap_or(0)
+        || hi > u8::try_from(MAX_LANES).unwrap_or(0)
+        || lo > hi
+    {
         return None;
     }
     Some((lo, hi))
@@ -2319,8 +2311,7 @@ fn start_race(state: &mut State) {
     let label = state
         .lineup
         .get(state.current_event as usize - 1)
-        .map(|e| e.label())
-        .unwrap_or_else(|| format!("event {}", state.current_event));
+        .map_or_else(|| format!("event {}", state.current_event), EventDef::label);
     println!(
         "race {race_no} started — {label} heat {heat} (touch lanes 1..8 — each touch is a split, / to finalize)",
         heat = state.current_heat,
@@ -2356,19 +2347,18 @@ fn touch_lane(state: &mut State, lane: u8) {
         .in_progress
         .as_ref()
         .and_then(|ip| state.lineup.get(ip.event as usize - 1))
-        .map(|d| d.total_segments())
-        .unwrap_or(0);
-    let ip = match state.in_progress.as_mut() {
-        Some(i) => i,
-        None => {
-            println!("(no race in progress — press <enter> to start)");
-            return;
-        }
+        .map_or(0, EventDef::total_segments);
+    let Some(ip) = state.in_progress.as_mut() else {
+        println!("(no race in progress — press <enter> to start)");
+        return;
     };
-    let elapsed = Instant::now()
-        .saturating_duration_since(ip.started_at)
-        .as_millis()
-        .min(u32::MAX as u128) as u32;
+    let elapsed = u32::try_from(
+        Instant::now()
+            .saturating_duration_since(ip.started_at)
+            .as_millis()
+            .min(u128::from(u32::MAX)),
+    )
+    .unwrap_or(0);
     let cum = elapsed.max(1);
     let entry = &mut ip.lanes[lane_idx];
     if entry.finished_at.is_some() {
@@ -2384,7 +2374,7 @@ fn touch_lane(state: &mut State, lane: u8) {
     };
     entry.touches_ms.push(cum);
     play_beep();
-    let n = entry.touches_ms.len() as u16;
+    let n = u16::try_from(entry.touches_ms.len()).unwrap_or(0);
     if total_segments > 0 && n >= total_segments {
         entry.finished_at = Some(cum);
         println!(
@@ -2413,12 +2403,9 @@ fn dq_lane(state: &mut State, lane: u8) {
         println!("(lane {lane} out of range 1..={MAX_LANES})");
         return;
     }
-    let ip = match state.in_progress.as_mut() {
-        Some(i) => i,
-        None => {
-            println!("(no race in progress)");
-            return;
-        }
+    let Some(ip) = state.in_progress.as_mut() else {
+        println!("(no race in progress)");
+        return;
     };
     ip.lanes[lane_idx].dq = true;
     println!("  lane {lane} → DQ");
@@ -2435,12 +2422,9 @@ fn dq_lane(state: &mut State, lane: u8) {
 /// DQ lanes get place=0 (the parser surfaces them via the 0xFF
 /// sentinel → disqualified flag).
 fn finalize_race(state: &mut State) {
-    let ip = match state.in_progress.take() {
-        Some(i) => i,
-        None => {
-            println!("(no race in progress)");
-            return;
-        }
+    let Some(ip) = state.in_progress.take() else {
+        println!("(no race in progress)");
+        return;
     };
 
     // Build LaneResultRows + collect (lane_idx, finish_ms) for non-DQ
@@ -2453,7 +2437,7 @@ fn finalize_race(state: &mut State) {
         if !touched && !lt.dq {
             continue;
         }
-        let split_count = lt.split_prefix().len() as u8;
+        let split_count = u8::try_from(lt.split_prefix().len()).unwrap_or(0);
         if split_count > splits_max {
             splits_max = split_count;
         }
@@ -2466,7 +2450,7 @@ fn finalize_race(state: &mut State) {
     finishers.sort_by_key(|&(_, ms)| ms);
     for (place_minus_1, (lane_idx, _)) in finishers.iter().enumerate() {
         if let Some(r) = rows[*lane_idx].as_mut() {
-            r.place = (place_minus_1 + 1) as u8;
+            r.place = u8::try_from(place_minus_1 + 1).unwrap_or(0);
         }
     }
 
@@ -2500,7 +2484,7 @@ fn print_lineup(state: &State) {
         return;
     }
     for (i, e) in state.lineup.iter().enumerate() {
-        let marker = if (i + 1) as u16 == state.current_event {
+        let marker = if u16::try_from(i + 1).unwrap_or(0) == state.current_event {
             " ←"
         } else {
             ""
@@ -2573,10 +2557,10 @@ fn handle_command(state: &mut State, line: &str) -> bool {
                 // otherwise the in-progress race would inherit a stale
                 // number on /print.
                 if state.in_progress.is_some() {
-                    println!("cannot change /race while a race is in progress (finalize with / first)");
-                } else if let Some(n) =
-                    parts.next().and_then(|s| s.parse::<u16>().ok())
-                {
+                    println!(
+                        "cannot change /race while a race is in progress (finalize with / first)"
+                    );
+                } else if let Some(n) = parts.next().and_then(|s| s.parse::<u16>().ok()) {
                     state.next_race_no = n.max(1);
                     println!("next_race_no = {}", state.next_race_no);
                 } else {
@@ -2602,23 +2586,22 @@ fn handle_command(state: &mut State, line: &str) -> bool {
                         .next()
                         .and_then(|s| s.parse::<u16>().ok())
                         .unwrap_or(50);
-                    match (dist, gender, stroke) {
-                        (Some(d), Some(g), Some(s)) => {
-                            state.lineup.push(EventDef {
-                                distance: d,
-                                gender: g,
-                                stroke: s,
-                                split_yards,
-                            });
-                            println!(
-                                "added event {}: {} (splits every {split_yards} yd)",
-                                state.lineup.len(),
-                                state.lineup.last().unwrap().label()
-                            );
-                        }
-                        _ => println!(
-                            "usage: /lineup add <distance> <M|F|X> <stroke> [split_yards]\n  stroke: 1/FR  2/BK  3/BR  4/FL  5/IM  6/MED-R  7/FR-R  DV"
-                        ),
+                    if let (Some(d), Some(g), Some(s)) = (dist, gender, stroke) {
+                        state.lineup.push(EventDef {
+                            distance: d,
+                            gender: g,
+                            stroke: s,
+                            split_yards,
+                        });
+                        println!(
+                            "added event {}: {} (splits every {split_yards} yd)",
+                            state.lineup.len(),
+                            state.lineup.last().unwrap().label()
+                        );
+                    } else {
+                        println!(
+                        "usage: /lineup add <distance> <M|F|X> <stroke> [split_yards]\n  stroke: 1/FR  2/BK  3/BR  4/FL  5/IM  6/MED-R  7/FR-R  DV"
+                    );
                     }
                 }
                 "preset" => {
@@ -2670,19 +2653,20 @@ fn handle_command(state: &mut State, line: &str) -> bool {
                     let (lo, hi) = state.lane_spread;
                     println!("lane spread = {lo}..{hi}");
                 }
-                Some(spec) => match parse_lane_spread(spec) {
-                    Some((lo, hi)) => {
+                Some(spec) => {
+                    if let Some((lo, hi)) = parse_lane_spread(spec) {
                         if state.in_progress.is_some() {
                             println!("cannot change /lanes while a race is in progress (finalize with / first)");
                         } else {
                             state.lane_spread = (lo, hi);
                             println!("lane spread = {lo}..{hi}");
                         }
+                    } else {
+                        println!(
+                    "usage: /lanes A..B  (1..={MAX_LANES}, e.g. /lanes 1..10, /lanes 2..8, /lanes 1..1)"
+                );
                     }
-                    None => println!(
-                        "usage: /lanes A..B  (1..={MAX_LANES}, e.g. /lanes 1..10, /lanes 2..8, /lanes 1..1)"
-                    ),
-                },
+                }
             },
             "status" => {
                 let (lo, hi) = state.lane_spread;
@@ -2831,7 +2815,7 @@ fn main() {
         let s = Arc::clone(&state);
         let a = addr.clone();
         thread::spawn(move || {
-            if let Err(e) = run_server(&a, s) {
+            if let Err(e) = run_server(&a, &s) {
                 emu_log!("[net] fatal: {e}");
             }
         });
