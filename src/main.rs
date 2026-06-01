@@ -268,7 +268,7 @@ struct LaneResultRow {
 struct Race {
     event: u16,
     heat: u8,
-    race_no: u16,
+    id: u16,
     lanes: [Option<LaneResultRow>; MAX_LANES],
     /// Number of cumulative split slots emitted in the on-wire frame.
     /// Equals `max(splits_per_lane)` across all lanes — zero-padded for
@@ -442,8 +442,8 @@ fn build_event_response(race: &Race) -> Vec<u8> {
     buf[2] = (race.event & 0xFF) as u8; // echo low byte (short-frame path)
     buf[3] = race.heat;
     // race counter at bytes 6-7 LE u16 (parser reads it from here).
-    buf[6] = (race.race_no & 0xFF) as u8;
-    buf[7] = (race.race_no >> 8) as u8;
+    buf[6] = (race.id & 0xFF) as u8;
+    buf[7] = (race.id >> 8) as u8;
     // Lane-count slot at byte 16: required by long-with-splits
     // dispatcher; harmless for short frames (parser ignores it there).
     if splits > 0 {
@@ -459,7 +459,7 @@ fn build_event_response(race: &Race) -> Vec<u8> {
     // Heat LE u16 at 46-47.
     buf[46] = race.heat;
     // Race LE u16 at 48-49 (legacy slot — also mirrored here).
-    buf[48] = (race.race_no & 0xFF) as u8;
+    buf[48] = (race.id & 0xFF) as u8;
 
     for i in 0..lane_count {
         let base = 49 + i * stride;
@@ -1627,7 +1627,7 @@ fn draw_results_popup(frame: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
-            format!("  Race {}  ", race.race_no),
+            format!("  Race {}  ", race.id),
             Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -1758,7 +1758,7 @@ fn draw_results_popup(frame: &mut Frame, area: Rect, state: &Arc<Mutex<State>>, 
         width,
         height,
     };
-    let title = format!(" race {} results — Esc/Enter to close ", race.race_no);
+    let title = format!(" race {} results — Esc/Enter to close ", race.id);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -2458,12 +2458,12 @@ fn finalize_race(state: &mut State) {
     let race = Race {
         event: ip.event,
         heat: ip.heat,
-        race_no: ip.race_no,
+        id: ip.race_no,
         lanes: rows,
         splits_count: splits_max,
     };
     let key = (race.event, race.heat);
-    state.races.insert(race.race_no, race);
+    state.races.insert(race.id, race);
     state.history.entry(key).or_default().push(ip.race_no);
     // Fresh SSBIE will reseed; clear the cursor so a stale walk doesn't
     // skip the new latest race.
@@ -2507,12 +2507,12 @@ fn print_races(state: &State) {
         return;
     }
     let mut all: Vec<&Race> = state.races.values().collect();
-    all.sort_by_key(|r| r.race_no);
+    all.sort_by_key(|r| r.id);
     for r in all {
         let lanes = r.lanes.iter().filter(|l| l.is_some()).count();
         println!(
             "  race {:>3}: event {} heat {} ({lanes} lanes, {} splits)",
-            r.race_no, r.event, r.heat, r.splits_count,
+            r.id, r.event, r.heat, r.splits_count,
         );
     }
 }
