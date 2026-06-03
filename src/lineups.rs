@@ -4,14 +4,14 @@
 //! assigns directly to `State::lineup`. Add new presets here, then
 //! wire them into the `"preset"` arm of `handle_command` in
 //! `main.rs` so they're reachable from the REPL.
-use crate::{EventDef, Gender, Stroke};
+use crate::state::{EventDef, Gender, Stroke};
 
 /// Standard NFHS high-school dual-meet event order (12 events).
 /// All events share the caller-supplied gender; in a real coed dual
 /// the same 12 are run twice (girls then boys). Splits default to
 /// 50 yd, which matches CTS6 split-arm behaviour for these races.
 pub(crate) fn high_school_lineup_gender(gender: Gender) -> Vec<EventDef> {
-    use Stroke::{MedleyRelay, Free, Im, Diving, Fly, FreestyleRelay, Back, Breast};
+    use Stroke::{Back, Breast, Diving, Fly, Free, FreestyleRelay, Im, MedleyRelay};
     let mk = |distance: u16, stroke: Stroke| EventDef {
         distance,
         gender,
@@ -45,7 +45,7 @@ pub(crate) fn high_school_lineup_gender(gender: Gender) -> Vec<EventDef> {
 #[allow(dead_code)]
 pub(crate) fn coed_high_school_lineup() -> Vec<EventDef> {
     use Gender::{Female, Male, Mixed};
-    use Stroke::{MedleyRelay, Free, Im, Diving, Fly, FreestyleRelay, Back, Breast};
+    use Stroke::{Back, Breast, Diving, Fly, Free, FreestyleRelay, Im, MedleyRelay};
     let mk = |distance: u16, stroke: Stroke, gender: Gender| EventDef {
         distance,
         gender,
@@ -89,7 +89,7 @@ pub(crate) fn coed_high_school_lineup() -> Vec<EventDef> {
 // Taken from the CTS 6 hardware's "NCAA 13-event", "NCAA 15-event", and "NCAA 16-event" lineups
 
 pub(crate) fn ncaa_13_event(gender: Gender) -> Vec<EventDef> {
-    use Stroke::{MedleyRelay, Free, Im, Diving, Fly, Back, Breast, FreestyleRelay};
+    use Stroke::{Back, Breast, Diving, Fly, Free, FreestyleRelay, Im, MedleyRelay};
     let mk = |distance: u16, stroke: Stroke, gender: Gender| EventDef {
         distance,
         gender,
@@ -126,7 +126,7 @@ pub(crate) fn ncaa_13_event(gender: Gender) -> Vec<EventDef> {
 }
 
 pub(crate) fn ncaa_15_event(gender: Gender) -> Vec<EventDef> {
-    use Stroke::{Back, Breast, Fly, Free, MedleyRelay, Diving, FreestyleRelay};
+    use Stroke::{Back, Breast, Diving, Fly, Free, FreestyleRelay, MedleyRelay};
     let mk = |distance: u16, stroke: Stroke, gender: Gender| EventDef {
         distance,
         gender,
@@ -163,7 +163,7 @@ pub(crate) fn ncaa_15_event(gender: Gender) -> Vec<EventDef> {
 }
 
 pub(crate) fn ncaa_16_event(gender: Gender) -> Vec<EventDef> {
-    use Stroke::{MedleyRelay, Free, Back, Breast, Fly, Diving, Im, FreestyleRelay};
+    use Stroke::{Back, Breast, Diving, Fly, Free, FreestyleRelay, Im, MedleyRelay};
     let mk = |distance: u16, stroke: Stroke, gender: Gender| EventDef {
         distance,
         gender,
