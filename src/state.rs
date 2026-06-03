@@ -10,6 +10,13 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::emu_log;
+use crate::lineups;
+
+/// Number of sequence-memory event-program slots, matching the CTS6
+/// hardware. Slots 1–6 are factory-preset programs, 7–8 are blank
+/// "User Defined" slots that meet-management software can overwrite
+/// via the `Is`/`It`/`Iu`/`Ir` download sequence.
+pub(crate) const NUM_SLOTS: usize = 8;
 
 /// Maximum lane capacity tracked internally. Real CTS6 timers come in
 /// 8- and 10-lane variants; we provision the larger one and let the
@@ -201,6 +208,38 @@ pub(crate) struct State {
     /// when an `Is` frame arrives and committed to `lineup` when the
     /// closing `Ir` finalize-slot frame is received.
     pub(crate) loading: Option<LoadingMeet>,
+    /// 8 sequence-memory event-program slots. Mirrors the on-device
+    /// slot table: slots 1–6 are the factory programs, 7–8 are the
+    /// "User Defined" slots. A successful meet download (`Ir` finalize)
+    /// overwrites the targeted slot's name and lineup.
+    pub(crate) slots: [MeetSlot; NUM_SLOTS],
+    /// Currently-selected slot (`1..=NUM_SLOTS`), or `None` if no
+    /// program has been loaded yet. Selecting a slot copies its
+    /// stored lineup into `lineup` for race execution.
+    pub(crate) selected_slot: Option<u8>,
+    /// True iff the working `lineup` has diverged from the stored
+    /// lineup of `selected_slot`. Cleared by `/slot save`, by
+    /// `/slot N` (load), and by a meet-download finalize.
+    pub(crate) lineup_dirty: bool,
+    /// Date/time of the current meet, used for display and the
+    /// `T` (current-meet) on-wire reply. Captured once at startup
+    /// (`Local::now()`) and never mutated after that, so the meet
+    /// snapshot stays stable for the life of the process. Real CTS6
+    /// timers have a battery-backed clock; we freeze ours at boot.
+    pub(crate) meet_date: chrono::DateTime<chrono::Local>,
+}
+
+/// One of the 8 sequence-memory event-program slots.
+#[derive(Debug, Clone)]
+pub(crate) struct MeetSlot {
+    /// Human-readable slot name (≤20 chars on the wire). For factory
+    /// slots this is the canonical program label ("Boys High School",
+    /// "NCAA 13 Event", …); user-defined slots default to "User
+    /// Defined N" and are overwritten by `Is` meet-name frames.
+    pub(crate) name: String,
+    /// Stored event lineup. Loaded into `State::lineup` when this
+    /// slot is selected.
+    pub(crate) lineup: Vec<EventDef>,
 }
 
 /// Accumulator for an in-progress meet download. The chronaris-mm
@@ -269,7 +308,34 @@ impl State {
             cursor: HashMap::new(),
             lane_spread: (1, 8),
             loading: None,
+            slots: default_slots(),
+            selected_slot: None,
+            lineup_dirty: false,
+            meet_date: chrono::Local::now(),
         }
+    }
+
+    /// Copy the named slot's stored lineup into the active `lineup`
+    /// and update `selected_slot`. Returns false if `slot` is out of
+    /// range (`1..=NUM_SLOTS`).
+    pub(crate) fn select_slot(&mut self, slot: u8) -> bool {
+        if slot < 1 || (slot as usize) > NUM_SLOTS {
+            return false;
+        }
+        self.lineup = self.slots[(slot - 1) as usize].lineup.clone();
+        self.selected_slot = Some(slot);
+        self.lineup_dirty = false;
+        true
+    }
+
+    /// Persist the working `lineup` back to the currently-selected
+    /// slot. Returns the slot number on success, `None` if no slot
+    /// is selected.
+    pub(crate) fn save_to_selected_slot(&mut self) -> Option<u8> {
+        let n = self.selected_slot?;
+        self.slots[(n - 1) as usize].lineup = self.lineup.clone();
+        self.lineup_dirty = false;
+        Some(n)
     }
 
     /// Commit the buffered [`LoadingMeet`] (built up from `Is`/`It`/`Iu`
@@ -313,14 +379,12 @@ impl State {
             let gender = loading
                 .genders
                 .get(e.gender_idx as usize)
-                .map(|s| label_to_gender(s))
-                .unwrap_or(Gender::Mixed);
+                .map_or(Gender::Mixed, |s| label_to_gender(s));
             let stroke = label_to_stroke(
                 loading
                     .strokes
                     .get(e.stroke_idx as usize)
-                    .map(String::as_str)
-                    .unwrap_or(""),
+                    .map_or("", String::as_str),
                 e.is_relay,
             );
             lineup[(e.event_num - 1) as usize] = EventDef {
@@ -337,7 +401,18 @@ impl State {
             loading.events.len(),
             lineup.len()
         );
+        // Mirror the real hardware: a successful download overwrites
+        // the targeted slot's name and stored lineup, and selects it
+        // as the active program.
+        let slot = loading.slot;
+        if slot >= 1 && (slot as usize) <= NUM_SLOTS {
+            let idx = (slot - 1) as usize;
+            self.slots[idx].name = loading.name.clone();
+            self.slots[idx].lineup = lineup.clone();
+            self.selected_slot = Some(slot);
+        }
         self.lineup = lineup;
+        self.lineup_dirty = false;
     }
 
     pub(crate) fn lookup_latest(&mut self, event: u16, heat: u8) -> Option<&Race> {
@@ -428,4 +503,44 @@ pub(crate) fn label_to_stroke(label: &str, is_relay: bool) -> Stroke {
     } else {
         Stroke::Free
     }
+}
+
+/// Build the factory default sequence-memory slot table. Slots 1–6
+/// hold canonical event programs; slots 7–8 are blank "User Defined"
+/// slots a meet-management client can overwrite via meet download.
+fn default_slots() -> [MeetSlot; NUM_SLOTS] {
+    [
+        MeetSlot {
+            name: "Boys High School".to_string(),
+            lineup: lineups::high_school_lineup_gender(Gender::Male),
+        },
+        MeetSlot {
+            name: "Girls High School".to_string(),
+            lineup: lineups::high_school_lineup_gender(Gender::Female),
+        },
+        MeetSlot {
+            name: "Boys/Girls High School".to_string(),
+            lineup: lineups::coed_high_school_lineup(),
+        },
+        MeetSlot {
+            name: "NCAA 13 Event".to_string(),
+            lineup: lineups::ncaa_13_event(Gender::Mixed),
+        },
+        MeetSlot {
+            name: "NCAA 15 Event".to_string(),
+            lineup: lineups::ncaa_15_event(Gender::Mixed),
+        },
+        MeetSlot {
+            name: "NCAA 16 Event".to_string(),
+            lineup: lineups::ncaa_16_event(Gender::Mixed),
+        },
+        MeetSlot {
+            name: "User Defined 1".to_string(),
+            lineup: Vec::new(),
+        },
+        MeetSlot {
+            name: "User Defined 2".to_string(),
+            lineup: Vec::new(),
+        },
+    ]
 }

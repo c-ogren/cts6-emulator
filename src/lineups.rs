@@ -42,7 +42,6 @@ pub(crate) fn high_school_lineup_gender(gender: Gender) -> Vec<EventDef> {
 
 /// Coed high-school dual-meet order: the standard 12-event NFHS
 /// program run girls-then-boys for every event (diving stays mixed).
-#[allow(dead_code)]
 pub(crate) fn coed_high_school_lineup() -> Vec<EventDef> {
     use Gender::{Female, Male, Mixed};
     use Stroke::{Back, Breast, Diving, Fly, Free, FreestyleRelay, Im, MedleyRelay};

@@ -39,6 +39,11 @@ pub(crate) struct TuiApp {
     pub(crate) show_results: Option<u16>,
     pub(crate) show_lineup: bool,
     pub(crate) lineup_scroll: u16,
+    /// State of the sequence-memory slot popup. `None` means closed;
+    /// `List { cursor }` shows all 8 slots with `cursor` highlighting
+    /// one (Enter drills into Detail); `Detail { slot, scroll }`
+    /// shows that slot's stored lineup.
+    pub(crate) slot_popup: Option<SlotPopup>,
     pub(crate) focus: Focus,
     pub(crate) tree_expanded_events: HashSet<u16>,
     pub(crate) tree_expanded_heats: HashSet<(u16, u8)>,
@@ -63,6 +68,7 @@ impl TuiApp {
             show_results: None,
             show_lineup: false,
             lineup_scroll: 0,
+            slot_popup: None,
             focus: Focus::Input,
             tree_expanded_events: HashSet::new(),
             tree_expanded_heats: HashSet::new(),
@@ -76,6 +82,15 @@ impl TuiApp {
 pub(crate) enum Focus {
     Input,
     Tree,
+}
+
+/// Two-page state machine for the slot-memory popup.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SlotPopup {
+    /// List of all 8 slots, with `cursor` (0-based) highlighting one.
+    List { cursor: u8 },
+    /// Detail view of one slot: shows its stored event lineup.
+    Detail { slot: u8, scroll: u16 },
 }
 
 /// One visible row in the stored-events tree.
@@ -155,6 +170,14 @@ fn draw(f: &mut Frame, app: &TuiApp) {
     }
     if app.show_lineup {
         draw_lineup_popup(f, area, app);
+    }
+    if let Some(popup) = app.slot_popup {
+        match popup {
+            SlotPopup::List { cursor } => draw_slot_list_popup(f, area, app, cursor),
+            SlotPopup::Detail { slot, scroll } => {
+                draw_slot_detail_popup(f, area, app, slot, scroll);
+            }
+        }
     }
 }
 
@@ -687,17 +710,21 @@ fn build_help_lines() -> Vec<Line<'static>> {
         entry("/race N", "set next race number (resume mid-meet)"),
         entry("/lanes A..B", "set active lane spread (1..=10,"),
         cont("e.g. /lanes 1..10, 2..8, 1..1)"),
-        entry("/lineup show", "list configured events"),
+        entry("/slot", "open sequence-memory popup (↑↓ navigate,"),
+        cont("Enter view lineup, s select, Esc close)"),
+        entry("/slot N", "open slot N's lineup directly"),
+        entry("/slot save", "save working lineup → selected slot"),
         entry(
-            "/lineup preset P [G]",
-            "load preset lineup; gender defaults to Mixed:",
+            "/slot rename <name>",
+            "rename the selected slot (≤20 chars)",
         ),
-        cont("P = hs | ncaa13 | ncaa15 | ncaa16"),
-        cont("G = M | F | X"),
-        entry("/lineup add D G S [Y]", "add event (distance, M|F|X,"),
-        cont("stroke 1/FR 2/BK 3/BR 4/FL 5/IM"),
-        cont("6/MED-R 7/FR-R DV, optional split-yds)"),
-        entry("/lineup clear", "remove all events"),
+        entry("/lineup show", "list working-copy events"),
+        entry("/lineup add D G S [Y]", "add event to working copy"),
+        cont("(distance, M|F|X, stroke 1/FR 2/BK"),
+        cont("3/BR 4/FL 5/IM 6/MED-R 7/FR-R DV,"),
+        cont("optional split-yds)"),
+        entry("/lineup remove N", "delete event N from working copy"),
+        entry("/lineup clear", "empty the working-copy events"),
         blank(),
         section("running a race:"),
         key_entry("<enter>", "start the race (timestamp 0.000)"),
@@ -900,7 +927,7 @@ fn build_lineup_lines(s: &State) -> Vec<Line<'static>> {
 
     if s.lineup.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no lineup configured — try /lineup preset hs)",
+            "  (no lineup configured — /slot to pick one, or /lineup add …)",
             Style::new().fg(Color::DarkGray),
         )));
     } else {
@@ -1019,6 +1046,291 @@ fn lineup_max_scroll(state: &Arc<Mutex<State>>) -> u16 {
     content_h.saturating_sub(view_h)
 }
 
+/// Parse `/slot` (open list) or `/slot N` (open detail at slot N)
+/// into the corresponding popup state. Returns `None` for any other
+/// shape so the regular handler can deal with it (`/slot save`,
+/// `/slot rename …`, etc.).
+fn parse_slot_command(line: &str, state: &Arc<Mutex<State>>) -> Option<SlotPopup> {
+    let mut parts = line.split_whitespace();
+    if !matches!(parts.next(), Some("/slot" | "/slots")) {
+        return None;
+    }
+    let next = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match next {
+        // bare `/slot` → list view, cursor parked on the selected
+        // slot if any (otherwise slot 1).
+        None => {
+            let cursor = state
+                .lock()
+                .unwrap()
+                .selected_slot
+                .map_or(0, |n| n.saturating_sub(1));
+            Some(SlotPopup::List { cursor })
+        }
+        Some(tok) => {
+            let n = tok.parse::<u8>().ok()?;
+            if n >= 1 && (n as usize) <= crate::state::NUM_SLOTS {
+                Some(SlotPopup::Detail { slot: n, scroll: 0 })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn build_slot_list_lines(s: &State, cursor: u8) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Sequence Memory  ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({} slots)", crate::state::NUM_SLOTS),
+            Style::new().fg(Color::Gray),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    for (i, slot) in s.slots.iter().enumerate() {
+        let n = (i + 1) as u8;
+        let is_cursor = i as u8 == cursor;
+        let is_selected = s.selected_slot == Some(n);
+        let cursor_marker = if is_cursor { "▶" } else { " " };
+        let select_marker = if is_selected { " ← selected" } else { "" };
+        let count = slot.lineup.len();
+        let row_style = if is_cursor {
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::White)
+        };
+        let dim_style = if is_cursor {
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::new().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {cursor_marker} slot {n}: "), row_style),
+            Span::styled(format!("{:<22}", slot.name), row_style),
+            Span::styled(
+                format!(" {count:>2} event{}", if count == 1 { " " } else { "s" }),
+                dim_style,
+            ),
+            Span::styled(
+                select_marker.to_string(),
+                if is_selected {
+                    Style::new()
+                        .fg(if is_cursor {
+                            Color::Yellow
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if s.lineup_dirty && s.selected_slot.is_some() {
+        lines.push(Line::from(Span::styled(
+            "  working copy has unsaved edits — /slot save to commit",
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ navigate   Enter view lineup   s select   Esc close",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn build_slot_detail_lines(s: &State, slot: u8) -> Vec<Line<'static>> {
+    let idx = (slot - 1) as usize;
+    let mem = &s.slots[idx];
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  Slot {slot} Memory  "),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("\"{}\"", mem.name),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "({} event{})",
+                mem.lineup.len(),
+                if mem.lineup.len() == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(Color::Gray),
+        ),
+        if s.selected_slot == Some(slot) {
+            Span::styled(
+                "  ← selected",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("")
+        },
+    ]));
+    lines.push(Line::from(""));
+
+    if mem.lineup.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (empty slot — Enter to select, then /lineup add … then /slot save)",
+            Style::new().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  #     Event              Splits    Touches",
+            Style::new()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  ──────────────────────────────────────────────────",
+            Style::new().fg(Color::DarkGray),
+        )));
+        for (i, e) in mem.lineup.iter().enumerate() {
+            let event_no = u16::try_from(i + 1).unwrap_or(0);
+            let segs = e.total_segments();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {event_no:>3}  "),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{:<18} ", e.label()), Style::new().fg(Color::White)),
+                Span::styled(
+                    format!("{:>3}yd     ", e.split_yards),
+                    Style::new().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("{:>3} touch{}", segs, if segs == 1 { " " } else { "es" }),
+                    Style::new().fg(Color::Gray),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    if s.selected_slot == Some(slot) && s.lineup_dirty {
+        lines.push(Line::from(Span::styled(
+            "  working copy has unsaved edits — /slot save to commit",
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  ←/→ prev/next slot   ↑↓ scroll   Enter select   Esc/Backspace back",
+        Style::new().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+fn render_centered_popup(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    title: &str,
+    scroll: u16,
+) -> u16 {
+    let content_w = lines
+        .iter()
+        .map(|l| u16::try_from(l.width()).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
+    let want_w = content_w.saturating_add(4);
+    let want_h = content_h.saturating_add(2);
+    let w = want_w.min(area.width.saturating_sub(2)).max(30);
+    let h = want_h.min(area.height.saturating_sub(2)).max(7);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    let view_h = h.saturating_sub(2);
+    let max_scroll = content_h.saturating_sub(view_h);
+    let scroll = scroll.min(max_scroll);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .style(Style::new().fg(Color::White).bg(Color::Black));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup,
+    );
+    max_scroll
+}
+
+fn draw_slot_list_popup(frame: &mut Frame, area: Rect, app: &TuiApp, cursor: u8) {
+    let lines = {
+        let s = app.state.lock().unwrap();
+        build_slot_list_lines(&s, cursor)
+    };
+    let title = " sequence memory  ↑↓ navigate  Enter view  s select  Esc close ".to_string();
+    render_centered_popup(frame, area, lines, &title, 0);
+}
+
+fn draw_slot_detail_popup(frame: &mut Frame, area: Rect, app: &TuiApp, slot: u8, scroll: u16) {
+    let lines = {
+        let s = app.state.lock().unwrap();
+        build_slot_detail_lines(&s, slot)
+    };
+    let title = format!(
+        " slot {slot}/{n}  ←→ slot  ↑↓ scroll  Enter select  Esc/Bksp back ",
+        n = crate::state::NUM_SLOTS,
+    );
+    render_centered_popup(frame, area, lines, &title, scroll);
+}
+
+fn slot_detail_max_scroll(state: &Arc<Mutex<State>>, slot: u8) -> u16 {
+    let lines = {
+        let s = state.lock().unwrap();
+        build_slot_detail_lines(&s, slot)
+    };
+    let content_h = u16::try_from(lines.len()).unwrap_or(0);
+    let (_term_w, term_h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    let want_h = content_h.saturating_add(2);
+    let h = want_h.min(term_h.saturating_sub(2)).max(7);
+    let view_h = h.saturating_sub(2);
+    content_h.saturating_sub(view_h)
+}
+
+/// Apply `select_slot(n)` from a popup, logging the user-facing
+/// status messages. Refuses (and logs) if a race is in progress.
+fn popup_select_slot(state: &Arc<Mutex<State>>, n: u8) {
+    let mut s = state.lock().unwrap();
+    if s.in_progress.is_some() {
+        drop(s);
+        crate::emu_log!("cannot change /slot while a race is in progress (finalize with / first)");
+        return;
+    }
+    if s.lineup_dirty && s.selected_slot.is_some() && s.selected_slot != Some(n) {
+        let prev = s.selected_slot.unwrap();
+        crate::emu_log!("(discarding unsaved working-lineup edits from slot {prev})");
+    }
+    s.select_slot(n);
+    let name = s.slots[(n - 1) as usize].name.clone();
+    let count = s.lineup.len();
+    drop(s);
+    crate::emu_log!("selected slot {n}: \"{name}\" ({count} events)");
+}
+
 fn handle_event(app: &mut TuiApp, ev: &Event) {
     let key = match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => k,
@@ -1082,6 +1394,101 @@ fn handle_event(app: &mut TuiApp, ev: &Event) {
                 app.show_lineup = false;
                 app.lineup_scroll = 0;
             }
+        }
+        return;
+    }
+    if let Some(popup) = app.slot_popup {
+        let n_slots = crate::state::NUM_SLOTS as u8;
+        match popup {
+            SlotPopup::List { cursor } => match (key.code, key.modifiers) {
+                (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => app.quit = true,
+                (KeyCode::Up | KeyCode::Char('k'), _) => {
+                    let next = if cursor == 0 { n_slots - 1 } else { cursor - 1 };
+                    app.slot_popup = Some(SlotPopup::List { cursor: next });
+                }
+                (KeyCode::Down | KeyCode::Char('j'), _) => {
+                    let next = if cursor + 1 >= n_slots { 0 } else { cursor + 1 };
+                    app.slot_popup = Some(SlotPopup::List { cursor: next });
+                }
+                (KeyCode::Home, _) => {
+                    app.slot_popup = Some(SlotPopup::List { cursor: 0 });
+                }
+                (KeyCode::End, _) => {
+                    app.slot_popup = Some(SlotPopup::List {
+                        cursor: n_slots - 1,
+                    });
+                }
+                (KeyCode::Enter | KeyCode::Right | KeyCode::Char('l'), _) => {
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot: cursor + 1,
+                        scroll: 0,
+                    });
+                }
+                (KeyCode::Char('s'), _) => {
+                    popup_select_slot(&app.state, cursor + 1);
+                    app.slot_popup = None;
+                }
+                (KeyCode::Esc, _) => app.slot_popup = None,
+                _ => {}
+            },
+            SlotPopup::Detail { slot, scroll } => match (key.code, key.modifiers) {
+                (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => app.quit = true,
+                (KeyCode::Esc | KeyCode::Backspace, _) => {
+                    app.slot_popup = Some(SlotPopup::List { cursor: slot - 1 });
+                }
+                (KeyCode::Left | KeyCode::Char('h'), _) => {
+                    let prev = if slot <= 1 { n_slots } else { slot - 1 };
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot: prev,
+                        scroll: 0,
+                    });
+                }
+                (KeyCode::Right | KeyCode::Char('l'), _) => {
+                    let next = if slot >= n_slots { 1 } else { slot + 1 };
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot: next,
+                        scroll: 0,
+                    });
+                }
+                (KeyCode::Down | KeyCode::Char('j'), _) => {
+                    let max = slot_detail_max_scroll(&app.state, slot);
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot,
+                        scroll: scroll.saturating_add(1).min(max),
+                    });
+                }
+                (KeyCode::Up | KeyCode::Char('k'), _) => {
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot,
+                        scroll: scroll.saturating_sub(1),
+                    });
+                }
+                (KeyCode::PageDown | KeyCode::Char(' '), _) => {
+                    let max = slot_detail_max_scroll(&app.state, slot);
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot,
+                        scroll: scroll.saturating_add(8).min(max),
+                    });
+                }
+                (KeyCode::PageUp, _) => {
+                    app.slot_popup = Some(SlotPopup::Detail {
+                        slot,
+                        scroll: scroll.saturating_sub(8),
+                    });
+                }
+                (KeyCode::Home, _) => {
+                    app.slot_popup = Some(SlotPopup::Detail { slot, scroll: 0 });
+                }
+                (KeyCode::End, _) => {
+                    let max = slot_detail_max_scroll(&app.state, slot);
+                    app.slot_popup = Some(SlotPopup::Detail { slot, scroll: max });
+                }
+                (KeyCode::Enter, _) => {
+                    popup_select_slot(&app.state, slot);
+                    app.slot_popup = None;
+                }
+                _ => {}
+            },
         }
         return;
     }
@@ -1178,11 +1585,10 @@ fn handle_event(app: &mut TuiApp, ev: &Event) {
         (KeyCode::Enter, _) => {
             let line = std::mem::take(&mut app.input);
             app.cursor = 0;
-            if !line.trim().is_empty() {
-                if app.history.last().map(std::string::String::as_str) != Some(line.as_str()) {
+            if !line.trim().is_empty()
+                && app.history.last().map(std::string::String::as_str) != Some(line.as_str()) {
                     app.history.push(line.clone());
                 }
-            }
             app.history_idx = None;
             app.scratch.clear();
             let trimmed = line.trim();
@@ -1194,6 +1600,10 @@ fn handle_event(app: &mut TuiApp, ev: &Event) {
             if trimmed == "/lineup show" || trimmed == "/lineup" {
                 app.show_lineup = true;
                 app.lineup_scroll = 0;
+                return;
+            }
+            if let Some(popup) = parse_slot_command(trimmed, &app.state) {
+                app.slot_popup = Some(popup);
                 return;
             }
             let keep = {

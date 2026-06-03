@@ -8,7 +8,7 @@ use crate::protocol::{
     build_event_response, comm_test_ack, commit_ack, finalize_ack, identify_reply, load_ack,
     meet_status_reply, nack, no_data_reply, parse_request, read_frame, slot_reply, Request, Verb,
 };
-use crate::state::{LoadedEvent, LoadingMeet, State};
+use crate::state::{LoadedEvent, LoadingMeet, State, NUM_SLOTS};
 use crate::{emu_log, hex};
 
 pub(crate) fn handle_client(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
@@ -31,9 +31,24 @@ pub(crate) fn handle_client(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
         let reply = match req {
             Request::Identify => Some(identify_reply()),
             Request::Commit => Some(commit_ack()),
-            Request::CommTest => Some(comm_test_ack()),
-            Request::Slot(s) => Some(slot_reply(s)),
-            Request::MeetStatus => Some(meet_status_reply()),
+            Request::CommTest => {
+                emu_log!("[net] comm-test wake from {peer} -> ack");
+                Some(comm_test_ack())
+            }
+            Request::Slot(s) => {
+                let st = state.lock().unwrap();
+                let name = if s >= 1 && (s as usize) <= NUM_SLOTS {
+                    st.slots[(s - 1) as usize].name.clone()
+                } else {
+                    String::new()
+                };
+                emu_log!("[slot-list] Rs slot={s} -> \"{name}\"");
+                Some(slot_reply(s, &name))
+            }
+            Request::MeetStatus => {
+                let st = state.lock().unwrap();
+                Some(meet_status_reply(&st.meet_date))
+            }
             Request::Fetch { verb, heat, event } => {
                 let mut s = state.lock().unwrap();
                 let race = match verb {

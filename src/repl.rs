@@ -1,8 +1,9 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::lineups;
-use crate::state::{EventDef, Gender, InProgress, LaneResultRow, Race, State, Stroke, MAX_LANES};
+use crate::state::{
+    EventDef, Gender, InProgress, LaneResultRow, Race, State, Stroke, MAX_LANES, NUM_SLOTS,
+};
 use crate::{fmt_time, play_beep};
 
 #[allow(unused_macros)]
@@ -231,9 +232,182 @@ pub(crate) fn finalize_race(state: &mut State) {
     state.current_heat = state.current_heat.saturating_add(1);
 }
 
+pub(crate) fn print_slots(state: &State) {
+    let sel = state.selected_slot;
+    for (i, s) in state.slots.iter().enumerate() {
+        let n = i + 1;
+        let marker = if sel == Some(n as u8) { " ←" } else { "" };
+        let count = s.lineup.len();
+        println!(
+            "  slot {n}: \"{}\" ({count} event{}){marker}",
+            s.name,
+            if count == 1 { "" } else { "s" },
+        );
+    }
+    if sel.is_none() {
+        println!("(no slot selected — /slot N to load one)");
+    } else if state.lineup_dirty {
+        println!("(working lineup has unsaved edits — /slot save to commit)");
+    }
+}
+
+/// Print the lineup stored in slot `n` (1-based) — i.e. the slot's
+/// persisted contents, NOT the (possibly edited) working `lineup`.
+pub(crate) fn print_slot_lineup(state: &State, n: u8) {
+    let idx = (n - 1) as usize;
+    let slot = &state.slots[idx];
+    println!(
+        "slot {n}: \"{}\" ({} event{}){}",
+        slot.name,
+        slot.lineup.len(),
+        if slot.lineup.len() == 1 { "" } else { "s" },
+        if state.selected_slot == Some(n) {
+            " ← selected"
+        } else {
+            ""
+        },
+    );
+    if slot.lineup.is_empty() {
+        println!("  (empty slot)");
+        return;
+    }
+    for (i, e) in slot.lineup.iter().enumerate() {
+        let segs = e.total_segments();
+        println!(
+            "  event {:>3}: {} (splits/{}yd, {} touch{})",
+            i + 1,
+            e.label(),
+            e.split_yards,
+            segs,
+            if segs == 1 { "" } else { "es" },
+        );
+    }
+}
+
+fn dirty_hint(state: &State) -> &'static str {
+    if state.selected_slot.is_some() && state.lineup_dirty {
+        "  [unsaved — /slot save]"
+    } else {
+        ""
+    }
+}
+
+fn handle_slot_command(state: &mut State, parts: &mut std::str::SplitWhitespace<'_>) {
+    let sub = parts.next().unwrap_or("list");
+    match sub {
+        "list" => print_slots(state),
+        "show" => {
+            let target = parts
+                .next()
+                .and_then(|s| s.parse::<u8>().ok())
+                .or(state.selected_slot);
+            match target {
+                Some(n) if n >= 1 && (n as usize) <= NUM_SLOTS => {
+                    print_slot_lineup(state, n);
+                }
+                Some(n) => println!("slot {n} out of range (1..={NUM_SLOTS})"),
+                None => println!("no slot selected — usage: /slot show <1..={NUM_SLOTS}>"),
+            }
+        }
+        "save" => {
+            if state.in_progress.is_some() {
+                println!("cannot /slot save while a race is in progress (finalize with / first)");
+            } else if let Some(n) = state.save_to_selected_slot() {
+                let slot = &state.slots[(n - 1) as usize];
+                println!(
+                    "saved working lineup to slot {n}: \"{}\" ({} events)",
+                    slot.name,
+                    slot.lineup.len(),
+                );
+            } else {
+                println!("no slot selected — /slot use N first");
+            }
+        }
+        "rename" => {
+            let Some(n) = state.selected_slot else {
+                println!("no slot selected — /slot use N first");
+                return;
+            };
+            let rest: Vec<&str> = parts.collect();
+            if rest.is_empty() {
+                println!("usage: /slot rename <new name>");
+                return;
+            }
+            let mut name = rest.join(" ");
+            if name.len() > 20 {
+                name.truncate(20);
+            }
+            state.slots[(n - 1) as usize].name = name.clone();
+            println!("slot {n} renamed to \"{name}\"");
+        }
+        "use" | "select" | "load" => {
+            let Some(n) = parts.next().and_then(|s| s.parse::<u8>().ok()) else {
+                println!("usage: /slot use <1..={NUM_SLOTS}>");
+                return;
+            };
+            slot_use(state, n);
+        }
+        n_str => {
+            if let Ok(n) = n_str.parse::<u8>() {
+                if (1..=NUM_SLOTS as u8).contains(&n) {
+                    // Bare `/slot N` shows the slot's stored lineup.
+                    // Use `/slot use N` to actually load it as the
+                    // active working copy.
+                    print_slot_lineup(state, n);
+                } else {
+                    println!("slot {n} out of range (1..={NUM_SLOTS})");
+                }
+            } else {
+                println!(
+                    "unknown slot subcommand: {sub} (try /slot | /slot N | /slot use N | /slot save | /slot rename <name>)"
+                );
+            }
+        }
+    }
+}
+
+fn slot_use(state: &mut State, n: u8) {
+    if state.in_progress.is_some() {
+        println!("cannot change /slot while a race is in progress (finalize with / first)");
+        return;
+    }
+    if !(1..=NUM_SLOTS as u8).contains(&n) {
+        println!("slot {n} out of range (1..={NUM_SLOTS})");
+        return;
+    }
+    if state.lineup_dirty && state.selected_slot.is_some() && state.selected_slot != Some(n) {
+        println!(
+            "(discarding unsaved working-lineup edits from slot {})",
+            state.selected_slot.unwrap()
+        );
+    }
+    state.select_slot(n);
+    let slot = &state.slots[(n - 1) as usize];
+    println!(
+        "selected slot {n}: \"{}\" ({} events)",
+        slot.name,
+        slot.lineup.len(),
+    );
+}
+
 pub(crate) fn print_lineup(state: &State) {
+    let header = match state.selected_slot {
+        Some(n) => {
+            let dirty = if state.lineup_dirty {
+                " [unsaved edits]"
+            } else {
+                ""
+            };
+            format!(
+                "working lineup (from slot {n}: \"{}\"){dirty}",
+                state.slots[(n - 1) as usize].name
+            )
+        }
+        None => "working lineup (no slot selected)".to_string(),
+    };
+    println!("{header}");
     if state.lineup.is_empty() {
-        println!("(no lineup configured)");
+        println!("  (no events configured)");
         return;
     }
     for (i, e) in state.lineup.iter().enumerate() {
@@ -337,10 +511,12 @@ pub(crate) fn handle_command(state: &mut State, line: &str) -> bool {
                             stroke: s,
                             split_yards,
                         });
+                        state.lineup_dirty = true;
                         println!(
-                            "added event {}: {} (splits every {split_yards} yd)",
+                            "added event {}: {} (splits every {split_yards} yd){}",
                             state.lineup.len(),
-                            state.lineup.last().unwrap().label()
+                            state.lineup.last().unwrap().label(),
+                            dirty_hint(state),
                         );
                     } else {
                         println!(
@@ -348,49 +524,35 @@ pub(crate) fn handle_command(state: &mut State, line: &str) -> bool {
                     );
                     }
                 }
-                "preset" => {
-                    let name = parts.next().unwrap_or("");
-                    let g = parts.next().and_then(parse_gender).unwrap_or(Gender::Mixed);
-                    match name {
-                        "hs" | "highschool" | "high-school" => {
-                            state.lineup = lineups::high_school_lineup_gender(g);
+                "remove" | "rm" | "del" | "delete" => {
+                    if let Some(n) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                        if n == 0 || n > state.lineup.len() {
                             println!(
-                                "loaded NFHS high-school dual-meet lineup ({} events)",
-                                state.lineup.len()
+                                "event {n} out of range (lineup has {} event{})",
+                                state.lineup.len(),
+                                if state.lineup.len() == 1 { "" } else { "s" },
+                            );
+                        } else {
+                            let removed = state.lineup.remove(n - 1);
+                            state.lineup_dirty = true;
+                            println!(
+                                "removed event {n}: {}{}",
+                                removed.label(),
+                                dirty_hint(state),
                             );
                         }
-                        "ncaa13" | "ncaa-13" => {
-                            state.lineup = lineups::ncaa_13_event(g);
-                            println!(
-                                "loaded NCAA 13-event program ({} events)",
-                                state.lineup.len()
-                            );
-                        }
-                        "ncaa15" | "ncaa-15" => {
-                            state.lineup = lineups::ncaa_15_event(g);
-                            println!(
-                                "loaded NCAA 15-event program ({} events)",
-                                state.lineup.len()
-                            );
-                        }
-                        "ncaa16" | "ncaa-16" => {
-                            state.lineup = lineups::ncaa_16_event(g);
-                            println!(
-                                "loaded NCAA 16-event program ({} events)",
-                                state.lineup.len()
-                            );
-                        }
-                        other => println!(
-                            "unknown preset: {other:?} (try /lineup preset hs|ncaa13|ncaa15|ncaa16 [M|F|X])"
-                        ),
+                    } else {
+                        println!("usage: /lineup remove N  (1-based event index)");
                     }
                 }
                 "clear" => {
                     state.lineup.clear();
-                    println!("lineup cleared");
+                    state.lineup_dirty = true;
+                    println!("lineup cleared{}", dirty_hint(state));
                 }
                 other => println!("unknown lineup subcommand: {other}"),
             },
+            "slot" | "slots" => handle_slot_command(state, &mut parts),
             "races" => print_races(state),
             "lanes" => match parts.next() {
                 None => {
@@ -414,8 +576,12 @@ pub(crate) fn handle_command(state: &mut State, line: &str) -> bool {
             },
             "status" => {
                 let (lo, hi) = state.lane_spread;
+                let slot_str = match state.selected_slot {
+                    Some(n) => format!("{n} \"{}\"", state.slots[(n - 1) as usize].name),
+                    None => "(none)".to_string(),
+                };
                 println!(
-                    "event={} heat={} next_race_no={} lanes={lo}..{hi} in_progress={} stored={}",
+                    "event={} heat={} next_race_no={} slot={slot_str} lanes={lo}..{hi} in_progress={} stored={}",
                     state.current_event,
                     state.current_heat,
                     state.next_race_no,
@@ -458,14 +624,23 @@ pub(crate) const HELP_TEXT: &str = "cts6 emulator commands:\n\
        /race  N                  set next race number (resume mid-meet)\n\
        /lanes A..B               set active lane spread (1..=10,\n\
                                    e.g. /lanes 1..10, 2..8, 1..1)\n\
-       /lineup show              list configured events\n\
-       /lineup preset P [G]      load preset lineup; gender defaults to Mixed:\n\
-                                   P = hs | ncaa13 | ncaa15 | ncaa16\n\
-                                   G = M | F | X\n\
-       /lineup add D G S [Y]     add event (distance, M|F|X,\n\
-                                   stroke 1/FR 2/BK 3/BR 4/FL 5/IM\n\
-                                   6/MED-R 7/FR-R DV, optional split-yds)\n\
-       /lineup clear             remove all events\n\
+       /slot                     open sequence-memory popup (TUI):\n\
+                                   ↑↓ navigate, Enter to view a slot's\n\
+                                   lineup, then Enter to load it,\n\
+                                   Esc/Backspace to go back\n\
+       /slot N                   show slot N's stored event lineup\n\
+       /slot use N               load slot N's lineup into the working\n\
+                                   copy (1..=8) for editing/use\n\
+       /slot save                save the working lineup back to the\n\
+                                   selected slot's memory\n\
+       /slot rename <name>       rename the selected slot (≤20 chars)\n\
+       /lineup show              list the working-copy events\n\
+       /lineup add D G S [Y]     add event to working copy\n\
+                                   (distance, M|F|X, stroke 1/FR 2/BK\n\
+                                   3/BR 4/FL 5/IM 6/MED-R 7/FR-R DV,\n\
+                                   optional split-yds)\n\
+       /lineup remove N          delete event N from working copy\n\
+       /lineup clear             empty the working-copy events\n\
      \n\
      running a race:\n\
        <enter>                   start the race (timestamp 0.000)\n\

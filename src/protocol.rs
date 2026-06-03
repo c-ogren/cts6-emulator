@@ -11,6 +11,8 @@
 use std::io::{self, Read};
 use std::net::TcpStream;
 
+use chrono::{Datelike, Timelike};
+
 use crate::current_year;
 use crate::state::Race;
 
@@ -356,10 +358,9 @@ pub(crate) fn comm_test_ack() -> Vec<u8> {
     vec![0x06, 0x00, 0x32, 0x01, 0x3B, 0xEB]
 }
 
-pub(crate) fn slot_reply(slot: u8) -> Vec<u8> {
+pub(crate) fn slot_reply(slot: u8, name: &str) -> Vec<u8> {
     // 26 bytes: 1A 00 <slot> <20 ASCII NUL-pad name> <flag1> <flag2> <chk_hi> <chk_lo>
-    let name = format!("Emulator Slot {slot}");
-    let mut name_bytes = name.into_bytes();
+    let mut name_bytes = name.as_bytes().to_vec();
     name_bytes.resize(20, 0);
     let mut buf = vec![0u8; 26];
     buf[0] = 0x1A;
@@ -373,20 +374,20 @@ pub(crate) fn slot_reply(slot: u8) -> Vec<u8> {
     buf
 }
 
-pub(crate) fn meet_status_reply() -> Vec<u8> {
+pub(crate) fn meet_status_reply(time: &chrono::DateTime<chrono::Local>) -> Vec<u8> {
     // 51-byte frame parsed by `parse_selected_meet_reply`.
     // Fields: second/minute/hour/dow/month/day at bytes 8..14, year LE
     // at 40-41, length byte 0x33 at byte 0.
     let mut buf = vec![0u8; 51];
     buf[0] = 0x33; // length sentinel
-    buf[8] = 0; // second
-    buf[9] = 0; // minute
-    buf[10] = 12; // hour
-    buf[11] = 7; // dow
-    buf[12] = 5; // month
-    buf[13] = 9; // day
-    buf[14] = (u8::try_from(current_year() - 2000)).unwrap_or(0); // year offset from 2000, clamped to fit in a byte
-    let year = current_year();
+    buf[8] = u8::try_from(time.second()).unwrap_or(0);
+    buf[9] = u8::try_from(time.minute()).unwrap_or(0);
+    buf[10] = u8::try_from(time.hour()).unwrap_or(0);
+    buf[11] = u8::try_from(time.weekday().num_days_from_sunday() + 1).unwrap_or(0); // dow 1=Sun..7=Sat
+    buf[12] = u8::try_from(time.month()).unwrap_or(0); // month
+    buf[13] = u8::try_from(time.day()).unwrap_or(0); // day
+    buf[14] = (u8::try_from(time.year() - 2000)).unwrap_or(0); // year offset from 2000, clamped to fit in a byte
+    let year = time.year();
     buf[40] = (year & 0xFF) as u8;
     buf[41] = (year >> 8) as u8;
     buf[50] = 0xFB; // trailer marker
