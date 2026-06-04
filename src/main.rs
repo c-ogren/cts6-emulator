@@ -38,10 +38,12 @@
 //!   SSBIE  long:   0D 00 53 53 42 49 45 <heat:le16> <event:le16> <chk> FD
 //!   event response: 0x05 short frame, 219 B (49 hdr + 8×21 lanes + 2 trailer).
 #![warn(clippy::pedantic)]
-#![warn(clippy::pedantic)]
 use std::io;
 use std::io::Write;
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex, OnceLock,
+};
 use std::thread;
 
 use ratatui::crossterm::{
@@ -67,7 +69,7 @@ pub(crate) static LOG_TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
 
 /// Channel into the dedicated audio thread. Each `()` triggers one
 /// playback of the embedded wall-touch beep.
-pub(crate) static AUDIO_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+pub(crate) static AUDIO_TX: OnceLock<mpsc::Sender<AudioMessage>> = OnceLock::new();
 
 /// Embedded WAV bytes for the wall-touch beep.
 const BEEP_WAV: &[u8] = include_bytes!("cts-beep.wav");
@@ -75,7 +77,7 @@ const BEEP_WAV: &[u8] = include_bytes!("cts-beep.wav");
 /// Fire the wall-touch beep once. Non-blocking.
 pub(crate) fn play_beep() {
     if let Some(tx) = AUDIO_TX.get() {
-        let _ = tx.send(());
+        let _ = tx.send(AudioMessage::Beep);
     }
 }
 
@@ -159,6 +161,11 @@ fn parse_args() -> String {
     addr
 }
 
+enum AudioMessage {
+    Beep,
+    Shutdown,
+}
+
 fn main() {
     let addr = parse_args();
     let state = Arc::new(Mutex::new(State::new()));
@@ -166,38 +173,52 @@ fn main() {
     let (log_tx, log_rx) = mpsc::channel::<String>();
     let _ = LOG_TX.set(log_tx);
 
-    let (audio_tx, audio_rx) = mpsc::channel::<()>();
-    let _ = AUDIO_TX.set(audio_tx);
-    thread::spawn(move || match rodio::OutputStream::try_default() {
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioMessage>();
+    let _ = AUDIO_TX.set(audio_tx.clone());
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    let audio_thread = thread::spawn(move || match rodio::OutputStream::try_default() {
         Ok((_stream, handle)) => {
-            while audio_rx.recv().is_ok() {
-                let cursor = std::io::Cursor::new(BEEP_WAV);
-                match rodio::Decoder::new(cursor) {
-                    Ok(source) => {
-                        if let Ok(sink) = rodio::Sink::try_new(&handle) {
-                            sink.append(source);
-                            sink.detach();
+            while let Ok(msg) = audio_rx.recv() {
+                match msg {
+                    AudioMessage::Beep => {
+                        let cursor = std::io::Cursor::new(BEEP_WAV);
+                        match rodio::Decoder::new(cursor) {
+                            Ok(source) => {
+                                if let Ok(sink) = rodio::Sink::try_new(&handle) {
+                                    sink.append(source);
+                                    sink.detach();
+                                }
+                            }
+                            Err(e) => emu_log!("[audio] decode failed: {e}"),
                         }
                     }
-                    Err(e) => emu_log!("[audio] decode failed: {e}"),
+                    AudioMessage::Shutdown => break,
                 }
             }
+
+            emu_log!("[audio] output stream closed, exiting audio thread");
         }
         Err(e) => {
             emu_log!("[audio] no output device ({e}) — beeps disabled");
             while audio_rx.recv().is_ok() {}
+
+            emu_log!("[audio] thread exiting");
         }
     });
 
-    {
+    let server_thread = {
         let s = Arc::clone(&state);
         let a = addr.clone();
+        let shutdown = Arc::clone(&shutdown_flag);
+
         thread::spawn(move || {
-            if let Err(e) = run_server(&a, &s) {
+            if let Err(e) = run_server(&a, &s, &shutdown) {
                 emu_log!("[net] fatal: {e}");
             }
-        });
-    }
+        })
+    };
 
     emu_log!("cts6-emulator on {addr} — type /help for commands  ·  Esc / Ctrl-C to quit");
 
@@ -208,5 +229,11 @@ fn main() {
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         eprintln!("[fatal] tui error: {e}");
     }
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+
+    let _ = audio_tx.send(AudioMessage::Shutdown);
+    let _ = audio_thread.join();
+    let _ = server_thread.join();
     println!("bye");
 }

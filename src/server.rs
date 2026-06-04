@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -170,17 +171,33 @@ pub(crate) fn handle_client(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
     emu_log!("[net] client disconnected: {peer}");
 }
 
-pub(crate) fn run_server(addr: &str, state: &Arc<Mutex<State>>) -> io::Result<()> {
+pub(crate) fn run_server(
+    addr: &str,
+    state: &Arc<Mutex<State>>,
+    shutdown: &Arc<AtomicBool>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+
     emu_log!("[net] listening on {addr}");
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
+
+    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let s = Arc::clone(state);
                 thread::spawn(move || handle_client(stream, &s));
             }
-            Err(e) => emu_log!("[net] accept error: {e}"),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // No incoming connection, sleep briefly to avoid busy waiting
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                emu_log!("[net] accept error: {e}");
+                break;
+            }
         }
     }
+
+    emu_log!("[net] server shutting down");
     Ok(())
 }

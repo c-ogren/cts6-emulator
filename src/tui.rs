@@ -1586,9 +1586,10 @@ fn handle_event(app: &mut TuiApp, ev: &Event) {
             let line = std::mem::take(&mut app.input);
             app.cursor = 0;
             if !line.trim().is_empty()
-                && app.history.last().map(std::string::String::as_str) != Some(line.as_str()) {
-                    app.history.push(line.clone());
-                }
+                && app.history.last().map(std::string::String::as_str) != Some(line.as_str())
+            {
+                app.history.push(line.clone());
+            }
             app.history_idx = None;
             app.scratch.clear();
             let trimmed = line.trim();
